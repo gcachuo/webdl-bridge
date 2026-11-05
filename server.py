@@ -729,6 +729,9 @@ class Handler(BaseHTTPRequestHandler):
                 web_id, fn, fpath, size = target
                 return self._serve_file(web_id, fpath, fn, size)
             if isinstance(target, str) and target.startswith("downloading:"):
+                ph = os.path.join(DATA_DIR, "downloading.mp4")
+                if os.path.exists(ph):
+                    return self._serve_file(0, ph, "downloading.mp4", os.path.getsize(ph))
                 st = target.split(":", 1)[1]
                 return self._send(503, f"webdl still downloading on TorBox ({st}) — retry in ~1min".encode(),
                                   "text/plain", {"Retry-After": "60"})
