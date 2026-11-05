@@ -39,3 +39,14 @@ After editing `server.py`, a recreate is enough (file is bind-mounted read-only 
 - TorBox-only backend; MegaUp links currently fail at `createwebdownload` (TorBox-side resolver bug: "Request URL is missing an 'http://' or 'https://' protocol").
 - Dead source links only work when TorBox has them cached.
 - TorBox does not extract archives — that's why extraction lives here.
+
+## Gate resolvers and metadata (v1.1+)
+
+- `RESOLVER_HOSTS` lists link-gate domains (today `todopaste.com`). `/r/` runs `resolve_gate`: fetch `/go/<id>` → parse `session_token`/`csrf`/`endpoint`/`completeUrl` → POST heartbeats to `/activity` until `can_complete` (~30s) → POST `/complete` → `destination_url`. Gate→destination cached in `links.json` as `gate_to`/`gate_from`. `GATE_TIMEOUT` env (default 90s).
+- Metadata: TMDB `/3/find/<imdb>?external_source=imdb_id` (env `TMDB_API`), Cinemeta fallback. Queries try `original_name` first — Latin sites usually use English titles.
+- Hoster allowlist (`supported_host`) does NOT apply to resolver domains — they pass through and get resolved at playback time.
+- Jackett-side: `MundoToon` indexer (fork) emits raw `/go/` links; any future indexer using todopaste works with no bridge changes.
+
+## Repo/deploy split
+
+Deployed copy lives at `F:\Videos\Plex\jellyfin-server\gelato\webdl-bridge\` (jellyfin-server repo, `docker-compose.yml` service `webdl-bridge`, bind-mounted `server.py`). This GitHub repo is the standalone distribution — keep `server.py` in sync between both when editing.
