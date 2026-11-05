@@ -305,10 +305,29 @@ def fmt_size(n):
 def prefetch(link):
     """Fire-and-forget: get the webdl created/downloading on TorBox early."""
     with _lock:
-        if link in _links:
+        entry = _links.get(link)
+        if is_resolver(link) and entry and entry.get("gate_to"):
+            real = entry["gate_to"]
+            if real in _links:
+                return
+            _links[real] = {"web_id": None, "prefetch": True}
+            link = real
+        elif entry:
             return
-        _links[link] = {"web_id": None, "prefetch": True}
+        else:
+            _links[link] = {"web_id": None, "prefetch": True}
     try:
+        if is_resolver(link):
+            real = resolve_gate(link)
+            with _lock:
+                _links[link] = {"gate_to": real, "gate_from": link}
+                existing = _links.get(real)
+                if existing and existing.get("web_id"):
+                    save_links()
+                    return
+                _links[real] = {"web_id": None, "prefetch": True}
+                save_links()
+            link = real
         res = http_post_form("https://api.torbox.app/v1/api/webdl/createwebdownload", {"link": link})
         web_id = (res.get("data") or {}).get("webdownload_id")
         with _lock:
@@ -383,7 +402,8 @@ def streams_for(media_type, req_id):
                 "behaviorHints": {"notWebReady": True},
             }
         )
-        if PREFETCH:
+        if PREFETCH and len(streams) == 1:
+            # only warm the first item: the rest are usually mirrors of the same file
             _pool.submit(prefetch, it["link"])
 
     with _lock:
