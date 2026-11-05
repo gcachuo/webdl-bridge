@@ -599,6 +599,7 @@ def do_resolve(link, ctx=None):
 
     item, web_id = ensure_webdl(link)
     deadline = time.time() + RESOLVE_TIMEOUT
+    last_state = None
     while True:
         if item is None:
             item = torbox_mylist(web_id)
@@ -616,8 +617,16 @@ def do_resolve(link, ctx=None):
                 return "files", (web_id, videos)
             if item.get("files"):
                 return None, "unsupported"
+        if item:
+            st = str(item.get("download_state") or item.get("status") or "")
+            if st != last_state:
+                pct = item.get("progress")
+                log(f"webdl {web_id} state={st} progress={pct}")
+                last_state = st
+            if any(x in st.lower() for x in ("failed", "error", "deleted", "expired")):
+                return None, f"torbox-state:{st}"
         if time.time() > deadline:
-            return None, "timeout"
+            return None, f"downloading:{last_state or 'unknown'}"
         time.sleep(5)
         item = None
 
@@ -713,6 +722,12 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "file":
                 web_id, fn, fpath, size = target
                 return self._serve_file(web_id, fpath, fn, size)
+            if isinstance(target, str) and target.startswith("downloading:"):
+                st = target.split(":", 1)[1]
+                return self._send(503, f"webdl still downloading on TorBox ({st}) — retry in ~1min".encode(),
+                                  "text/plain", {"Retry-After": "60"})
+            if isinstance(target, str) and target.startswith("torbox-state:"):
+                return self._send(502, f"webdl failed on TorBox: {target[13:]}".encode(), "text/plain")
             code = {"timeout": 503, "no-video-in-archive": 415, "unsupported": 415}.get(target, 502)
             return self._send(code, f"webdl resolve failed: {target}".encode(), "text/plain")
 
