@@ -303,45 +303,45 @@ def fmt_size(n):
 
 
 def prefetch(link):
-    """Fire-and-forget: get the webdl created/downloading on TorBox early."""
-    with _lock:
-        entry = _links.get(link)
-        if is_resolver(link) and entry and entry.get("gate_to"):
-            real = entry["gate_to"]
-            if real in _links:
-                return
-            _links[real] = {"web_id": None, "prefetch": True}
-            link = real
-        elif entry:
-            return
-        else:
-            _links[link] = {"web_id": None, "prefetch": True}
-    try:
-        if is_resolver(link):
-            real = resolve_gate(link)
-            with _lock:
-                _links[link] = {"gate_to": real, "gate_from": link}
-                existing = _links.get(real)
-                if existing and existing.get("web_id"):
+    """Fire-and-forget: warm the whole chain (gate -> webdl -> extraction)
+    so /r/ answers fast when the player/ffprobe hits it."""
+    if is_resolver(link):
+        with _lock:
+            real = (_links.get(link) or {}).get("gate_to")
+        if not real:
+            try:
+                real = resolve_gate(link)
+                with _lock:
+                    _links[link] = {"gate_to": real, "gate_from": link}
                     save_links()
+            except Exception as e:
+                log(f"prefetch gate error {link[:70]}: {e}")
+                return
+        resolve_async(real)
+        return
+    with _lock:
+        fresh = link not in _links
+        if fresh:
+            _links[link] = {"web_id": None, "prefetch": True}
+    if fresh:
+        try:
+            res = http_post_form("https://api.torbox.app/v1/api/webdl/createwebdownload", {"link": link})
+            web_id = (res.get("data") or {}).get("webdownload_id")
+            with _lock:
+                if web_id:
+                    _links[link] = {"web_id": web_id}
+                    save_links()
+                    log(f"prefetch ok web_id={web_id} {link[:70]}")
+                else:
+                    _links.pop(link, None)
+                    log(f"prefetch rejected {link[:70]}: {res.get('detail') or res.get('error')}")
                     return
-                _links[real] = {"web_id": None, "prefetch": True}
-                save_links()
-            link = real
-        res = http_post_form("https://api.torbox.app/v1/api/webdl/createwebdownload", {"link": link})
-        web_id = (res.get("data") or {}).get("webdownload_id")
-        with _lock:
-            if web_id:
-                _links[link] = {"web_id": web_id}
-                save_links()
-                log(f"prefetch ok web_id={web_id} {link[:70]}")
-            else:
+        except Exception as e:
+            with _lock:
                 _links.pop(link, None)
-                log(f"prefetch rejected {link[:70]}: {res.get('detail') or res.get('error')}")
-    except Exception as e:
-        with _lock:
-            _links.pop(link, None)
-        log(f"prefetch error {link[:70]}: {e}")
+            log(f"prefetch error {link[:70]}: {e}")
+            return
+    resolve_async(link)
 
 
 def streams_for(media_type, req_id):
@@ -430,7 +430,6 @@ def streams_for(media_type, req_id):
                 "name": f"⚡WebDL {it.get('indexer','')}".strip(),
                 "title": f"{it['title']}\n{tag}{host}" + (f" • 💾{size}" if size else ""),
                 "url": f"{PUBLIC_BASE}/r/{b64e(it['link'])}",
-                "behaviorHints": {"notWebReady": True},
             }
         )
         if PREFETCH and len(streams) == 1:
