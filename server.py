@@ -387,6 +387,37 @@ def streams_for(media_type, req_id):
                 continue
             seen.add(it["link"])
             found.append(it)
+
+    def dest_entry(it):
+        """Return (real_link, entry) for the torznab item, following gate_to."""
+        with _lock:
+            e = _links.get(it["link"]) or {}
+            real = (e.get("gate_to") or it["link"]) if is_resolver(it["link"]) else it["link"]
+            return real, _links.get(real) or {}
+
+    def live_web_id(it):
+        """web_id that still exists on TorBox (None purges stale entries)."""
+        real, entry = dest_entry(it)
+        web_id = entry.get("web_id")
+        if not web_id:
+            return None
+        try:
+            if torbox_mylist(web_id):
+                return web_id
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                return web_id  # API hiccup: keep it, assume alive
+        except Exception:
+            return web_id  # API hiccup: keep it, assume alive
+        with _lock:
+            _links.pop(real, None)
+            save_links()
+        return None
+
+    futures = [_pool.submit(live_web_id, it) for it in found]
+    ready = [f.result() is not None for f in futures]
+    # items already on TorBox first: mirrors needing a fresh download last
+    found = [it for _, it in sorted(zip(ready, found), key=lambda t: not t[0])]
     log(f"found {len(found)} hoster items for '{name}'")
 
     streams = []
