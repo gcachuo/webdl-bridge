@@ -22,13 +22,7 @@ Single source file: `server.py` (~550 lines). No dependencies beyond Python 3.12
 - `/stream` must stay fast: AIOStreams kills slow addons. Keep parallel queries + cache; never block on TorBox in the stream path.
 - No dependencies — stdlib only. Don't add requirements.txt/Flask; `ThreadingHTTPServer` is intentional.
 - **Never commit `.env` or `data/`** — they contain the TorBox API key and downloaded/extracted media.
-- One commit per functional change. Use the Devin trailer block:
-
-  ```
-  Generated with [Devin](https://devin.ai)
-
-  Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
-  ```
+- One commit per functional change.
 
 ## Commands
 
