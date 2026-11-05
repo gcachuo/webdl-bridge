@@ -53,6 +53,8 @@ RESOLVER_HOSTS = {h.strip().lower() for h in os.environ.get("RESOLVER_HOSTS", ""
 GATE_TIMEOUT = int(os.environ.get("GATE_TIMEOUT", "90"))
 # passwords tried when bsdtar fails on an encrypted archive (unrar)
 ARCHIVE_PASSWORDS = [p.strip() for p in os.environ.get("ARCHIVE_PASSWORDS", "").split(",") if p.strip()]
+# keep extracted files ~as long as TorBox keeps the source (30d since last play)
+EXTRACT_TTL = int(os.environ.get("EXTRACT_TTL", str(30 * 86400)))
 
 _links = {}          # link -> {"web_id": int, "file": name}
 _jobs = {}           # link -> threading.Event (in-flight resolve)
@@ -734,8 +736,17 @@ class Handler(BaseHTTPRequestHandler):
                     end = min(int(rm.group(2)), size - 1)
                 code = 206
         length = end - start + 1
+        mime = {
+            ".mp4": "video/mp4", ".m4v": "video/mp4", ".mkv": "video/x-matroska",
+            ".webm": "video/webm", ".avi": "video/x-msvideo", ".mov": "video/quicktime",
+            ".wmv": "video/x-ms-wmv", ".ts": "video/mp2t",
+        }.get(ext_of(fn), "video/x-matroska")
+        try:
+            os.utime(extract_dir(web_id))  # TTL counts from last play (TorBox-style)
+        except OSError:
+            pass
         self.send_response(code)
-        self.send_header("Content-Type", "video/x-matroska")
+        self.send_header("Content-Type", mime)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         if code == 206:
@@ -759,7 +770,36 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def janitor():
+    """Hourly: drop extracted dirs idle longer than EXTRACT_TTL and prune their
+    file entries (the web_id is kept — TorBox may still hold the source)."""
+    while True:
+        time.sleep(3600)
+        try:
+            cutoff = time.time() - EXTRACT_TTL
+            base = os.path.join(DATA_DIR, "extracted")
+            os.makedirs(base, exist_ok=True)
+            for name in os.listdir(base):
+                d = os.path.join(base, name)
+                if os.path.isdir(d) and os.path.getmtime(d) < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
+                    log(f"janitor removed {d}")
+            with _lock:
+                changed = False
+                for e in _links.values():
+                    wid = e.get("web_id")
+                    if wid and (e.get("file") or e.get("files")) and not os.path.isdir(extract_dir(wid)):
+                        e.pop("file", None)
+                        e.pop("files", None)
+                        changed = True
+                if changed:
+                    save_links()
+        except Exception as e:
+            log(f"janitor error: {e}")
+
+
 if __name__ == "__main__":
     load_links()
     log(f"webdl-bridge on :{PORT} indexers={INDEXERS} prefetch={PREFETCH}")
+    threading.Thread(target=janitor, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
