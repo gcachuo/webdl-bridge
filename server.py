@@ -59,6 +59,7 @@ EXTRACT_TTL = int(os.environ.get("EXTRACT_TTL", str(30 * 86400)))
 
 _links = {}          # link -> {"web_id": int, "file": name}
 _jobs = {}           # link -> threading.Event (in-flight resolve)
+_extract_locks = {}  # web_id -> threading.Lock (dedup download+extract)
 _stream_cache = {}   # req_id -> (ts, streams)
 _lock = threading.Lock()
 _pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
@@ -506,7 +507,8 @@ def download_and_extract(web_id, file_id, file_name=None):
     os.makedirs(out_dir, exist_ok=True)
     cdn = requestdl_url(web_id, file_id=file_id)
     real = http_get_noredirect(cdn, timeout=20) or cdn
-    archive_path = os.path.join(out_dir, "src" + (ext_of(file_name or "") or ".rar"))
+    archive_path = os.path.join(
+        out_dir, f"src-{os.getpid()}-{int(time.time()*1000)}" + (ext_of(file_name or "") or ".rar"))
     log(f"downloading archive web_id={web_id}")
     req = urllib.request.Request(real, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=600) as r, open(archive_path, "wb") as w:
@@ -610,12 +612,20 @@ def do_resolve(link, ctx=None):
             if video:
                 return "redirect", requestdl_url(web_id, file_id=video.get("id"))
             if archive:
-                videos = download_and_extract(web_id, archive.get("id"), archive.get("name") or archive.get("short_name"))
-                if not videos:
-                    return None, "no-video-in-archive"
                 with _lock:
-                    _links[link] = {"web_id": web_id, "files": videos}
-                    save_links()
+                    lk = _extract_locks.setdefault(web_id, threading.Lock())
+                with lk:
+                    # another link's job may have finished this web_id already
+                    with _lock:
+                        prev = (_links.get(link) or {}).get("files")
+                    if prev:
+                        return "files", (web_id, prev)
+                    videos = download_and_extract(web_id, archive.get("id"), archive.get("name") or archive.get("short_name"))
+                    if not videos:
+                        return None, "no-video-in-archive"
+                    with _lock:
+                        _links[link] = {"web_id": web_id, "files": videos}
+                        save_links()
                 return "files", (web_id, videos)
             if item.get("files"):
                 return None, "unsupported"
