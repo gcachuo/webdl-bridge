@@ -439,8 +439,22 @@ def streams_for(media_type, req_id):
     found = sorted(found, key=lambda it: not ready[id(it)])
     log(f"found {len(found)} hoster items for '{name}'")
 
+    def pack_range(it):
+        """(start, end) episode range if the link is a season pack (via ?fl= filename)."""
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(it["link"]).query)
+        try:
+            fl = b64d(qs["fl"][0]) if qs.get("fl") else it["title"]
+        except Exception:
+            fl = it["title"]
+        m = re.search(r"e0*(\d+)\s*-\s*0*(\d+)", fl, re.I)
+        return (int(m.group(1)), int(m.group(2))) if m else None
+
     streams = []
     for it in found:
+        if episode is not None:
+            rng = pack_range(it)
+            if rng and not (rng[0] <= episode <= rng[1]):
+                continue  # season pack doesn't contain this episode
         host = host_of(it["link"])
         size = fmt_size(it["size"])
         tag = "📦" if it["kind"] == "archive" else "🌐"
@@ -690,6 +704,8 @@ def resolve_async(link, ctx=None):
         web_id, videos = res[1]
         picked = pick_episode(videos, ctx)
         if not picked:
+            if len(videos) > 1 and re.search(r":\d+:\d+$", ctx or ""):
+                return None, "episode-not-in-pack"  # better than serving the wrong episode
             picked = max(videos, key=lambda v: os.path.getsize(os.path.join(extract_dir(web_id), v)))
         p = os.path.join(extract_dir(web_id), picked)
         return "file", (web_id, picked, p, os.path.getsize(p))
@@ -760,7 +776,8 @@ class Handler(BaseHTTPRequestHandler):
                                   "text/plain", {"Retry-After": "60"})
             if isinstance(target, str) and target.startswith("torbox-state:"):
                 return self._send(502, f"webdl failed on TorBox: {target[13:]}".encode(), "text/plain")
-            code = {"timeout": 503, "no-video-in-archive": 415, "unsupported": 415}.get(target, 502)
+            code = {"timeout": 503, "no-video-in-archive": 415, "unsupported": 415,
+                    "episode-not-in-pack": 404}.get(target, 502)
             return self._send(code, f"webdl resolve failed: {target}".encode(), "text/plain")
 
         m = re.match(r"^/f/(\d+)/(.+)$", path)
