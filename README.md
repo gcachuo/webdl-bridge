@@ -47,6 +47,7 @@ See `.env.example`. Notables:
 - `INDEXERS` — comma-separated Jackett indexer ids to query.
 - `PREFETCH` — fire `createwebdownload` in the background when listing streams (recommended; costs TorBox API calls).
 - `RESOLVE_TIMEOUT` — max wait for TorBox to fetch from the hoster (extraction time not included).
+- `ARCHIVE_PASSWORDS` — comma-separated passwords tried (via `unrar`) when `bsdtar` fails on an encrypted archive.
 - Extracted files persist in `data/extracted/<web_id>/`; repeat plays are instant.
 
 ## Limits

@@ -34,7 +34,7 @@ PORT = int(os.environ.get("PORT", "4700"))
 TORBOX_API = os.environ["TORBOX_API"]
 JACKETT_URL = os.environ.get("JACKETT_URL", "http://localhost:9118").rstrip("/")
 JACKETT_APIKEY = os.environ["JACKETT_APIKEY"]
-INDEXERS = [i.strip() for i in os.environ.get("INDEXERS", "lamovie").split(",") if i.strip()]
+INDEXERS = [i.strip() for i in os.environ["INDEXERS"].split(",") if i.strip()]
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "http://localhost:4700").rstrip("/")
 RESOLVE_TIMEOUT = int(os.environ.get("RESOLVE_TIMEOUT", "300"))
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
@@ -48,9 +48,11 @@ PLAYABLE = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".webm")
 ARCHIVE = (".rar", ".zip", ".7z", ".tar", ".tar.gz", ".tgz", ".001")
 
 # Link-gate domains resolved here instead of via TorBox allowlist.
-# todopaste /go/<id>: countdown gate -> POST /activity heartbeats -> /complete
-RESOLVER_HOSTS = {"todopaste.com"}
+# gate flow: countdown page -> POST /activity heartbeats -> /complete
+RESOLVER_HOSTS = {h.strip().lower() for h in os.environ.get("RESOLVER_HOSTS", "").split(",") if h.strip()}
 GATE_TIMEOUT = int(os.environ.get("GATE_TIMEOUT", "90"))
+# passwords tried when bsdtar fails on an encrypted archive (unrar)
+ARCHIVE_PASSWORDS = [p.strip() for p in os.environ.get("ARCHIVE_PASSWORDS", "").split(",") if p.strip()]
 
 _links = {}          # link -> {"web_id": int, "file": name}
 _jobs = {}           # link -> threading.Event (in-flight resolve)
@@ -252,7 +254,7 @@ def is_resolver(url):
 
 
 def resolve_gate(url):
-    """Emulate a link-gate countdown (todopaste /go/<id>) -> real destination URL."""
+    """Emulate a link-gate countdown (/go/<id>) -> real destination URL."""; s
     cj = http.cookiejar.CookieJar()
     op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
 
@@ -429,7 +431,7 @@ def streams_for(media_type, req_id):
             {
                 "name": f"⚡WebDL {it.get('indexer','')}".strip(),
                 "title": f"{it['title']}\n{tag}{host}" + (f" • 💾{size}" if size else ""),
-                "url": f"{PUBLIC_BASE}/r/{b64e(it['link'])}",
+                "url": f"{PUBLIC_BASE}/r/{b64e(it['link'] + '|' + req_id)}",
             }
         )
         if PREFETCH and len(streams) == 1:
@@ -506,17 +508,24 @@ def download_and_extract(web_id, file_id, file_name=None):
     with urllib.request.urlopen(req, timeout=600) as r, open(archive_path, "wb") as w:
         shutil.copyfileobj(r, w, 1024 * 1024)
     log(f"extracting {archive_path}")
-    subprocess.run(["bsdtar", "-xf", archive_path, "-C", out_dir], check=True, timeout=600)
+    try:
+        subprocess.run(["bsdtar", "-xf", archive_path, "-C", out_dir], check=True, timeout=600)
+    except subprocess.CalledProcessError:
+        # likely encrypted (bsdtar can't do crypto): try unrar with known passwords
+        for pw in ARCHIVE_PASSWORDS:
+            r = subprocess.run(["unrar", "x", "-o+", f"-p{pw}", archive_path, out_dir + "/"],
+                               timeout=600, capture_output=True)
+            if r.returncode == 0:
+                break
+        else:
+            raise RuntimeError("extraction failed (encrypted archive, no working password)")
     os.remove(archive_path)
-    best, best_size = None, 0
+    videos = []
     for root, _, files in os.walk(out_dir):
         for fn in files:
             if ext_of(fn) in PLAYABLE:
-                p = os.path.join(root, fn)
-                s = os.path.getsize(p)
-                if s > best_size:
-                    best, best_size = p, s
-    return best
+                videos.append(os.path.relpath(os.path.join(root, fn), out_dir))
+    return videos
 
 
 def ensure_webdl(link):
@@ -541,11 +550,30 @@ def ensure_webdl(link):
     return None, web_id
 
 
-def do_resolve(link):
-    """Blocking resolve. Returns (kind, target): kind 'redirect'|'file'."""
+def pick_episode(files, ctx):
+    """Choose the extracted file matching ctx 'ttID:S:E' (season packs hold all eps)."""
+    m = re.search(r":(\d+):(\d+)$", ctx or "")
+    if not m:
+        return None
+    ss, ee = int(m.group(1)), int(m.group(2))
+    pats = [
+        rf"s0*{ss}e0*{ee}(?!\d)",
+        rf"(?<![a-z0-9])e0*{ee}(?!\d)",
+        rf"^0*{ee}\s*[-_.]",
+        rf"(?<!\d)0*{ee}(?!\d)",
+    ]
+    for pat in pats:
+        for f in files:
+            if re.search(pat, os.path.basename(f).lower()):
+                return f
+    return None
+
+
+def do_resolve(link, ctx=None):
+    """Blocking resolve. Returns (kind, target): kind 'redirect'|'files'."""
     with _lock:
         entry = _links.get(link) or {}
-    # Resolve link gates (e.g. todopaste /go/) to the real hoster URL first;
+    # Resolve link gates (/go/ countdown pages) to the real hoster URL first;
     # cache the mapping so replays skip the countdown.
     if is_resolver(link):
         if entry.get("gate_to"):
@@ -560,10 +588,11 @@ def do_resolve(link):
             entry = _links.get(link) or {}
     # already extracted?
     web_id = entry.get("web_id")
-    if web_id and entry.get("file"):
-        p = os.path.join(extract_dir(web_id), entry["file"])
+    files = entry.get("files") or ([entry["file"]] if entry.get("file") else [])
+    if web_id and files:
+        p = os.path.join(extract_dir(web_id), files[0])
         if os.path.exists(p):
-            return "file", (web_id, entry["file"], p, os.path.getsize(p))
+            return "files", (web_id, files)
 
     item, web_id = ensure_webdl(link)
     deadline = time.time() + RESOLVE_TIMEOUT
@@ -575,14 +604,13 @@ def do_resolve(link):
             if video:
                 return "redirect", requestdl_url(web_id, file_id=video.get("id"))
             if archive:
-                path = download_and_extract(web_id, archive.get("id"), archive.get("name") or archive.get("short_name"))
-                if not path:
+                videos = download_and_extract(web_id, archive.get("id"), archive.get("name") or archive.get("short_name"))
+                if not videos:
                     return None, "no-video-in-archive"
-                fn = os.path.basename(path)
                 with _lock:
-                    _links[link] = {"web_id": web_id, "file": fn}
+                    _links[link] = {"web_id": web_id, "files": videos}
                     save_links()
-                return "file", (web_id, fn, path, os.path.getsize(path))
+                return "files", (web_id, videos)
             if item.get("files"):
                 return None, "unsupported"
         if time.time() > deadline:
@@ -591,8 +619,9 @@ def do_resolve(link):
         item = None
 
 
-def resolve_async(link):
-    """Dedup: concurrent resolves of the same link share one job."""
+def resolve_async(link, ctx=None):
+    """Dedup: concurrent resolves of the same link share one job.
+    'files' results are post-selected per caller via ctx (episode pick)."""
     with _lock:
         ev = _jobs.get(link)
         if ev is None:
@@ -615,7 +644,15 @@ def resolve_async(link):
                     _jobs.pop(link, None)
         _pool.submit(run)
     ev.wait(timeout=RESOLVE_TIMEOUT + 660)
-    return ev.result or (None, "timeout")
+    res = ev.result or (None, "timeout")
+    if res[0] == "files":
+        web_id, videos = res[1]
+        picked = pick_episode(videos, ctx)
+        if not picked:
+            picked = max(videos, key=lambda v: os.path.getsize(os.path.join(extract_dir(web_id), v)))
+        p = os.path.join(extract_dir(web_id), picked)
+        return "file", (web_id, picked, p, os.path.getsize(p))
+    return res
 
 
 MANIFEST = {
@@ -660,11 +697,11 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/r/([A-Za-z0-9_-]+)$", path)
         if m:
             try:
-                link = b64d(m.group(1))
+                link, _, ctx = b64d(m.group(1)).partition("|")
             except Exception:
                 return self._send(400, b"bad link", "text/plain")
             log(f"resolve {link[:80]}")
-            (kind, target) = resolve_async(link) or (None, "error")
+            (kind, target) = resolve_async(link, ctx or None) or (None, "error")
             if kind == "redirect":
                 return self._send(302, b"", "text/plain", {"Location": target})
             if kind == "file":
@@ -673,14 +710,12 @@ class Handler(BaseHTTPRequestHandler):
             code = {"timeout": 503, "no-video-in-archive": 415, "unsupported": 415}.get(target, 502)
             return self._send(code, f"webdl resolve failed: {target}".encode(), "text/plain")
 
-        m = re.match(r"^/f/(\d+)$", path)
+        m = re.match(r"^/f/(\d+)/(.+)$", path)
         if m:
-            web_id = m.group(1)
-            for entry in _links.values():
-                if entry.get("web_id") == int(web_id) and entry.get("file"):
-                    fpath = os.path.join(extract_dir(web_id), entry["file"])
-                    if os.path.exists(fpath):
-                        return self._serve_file(web_id, fpath, entry["file"], os.path.getsize(fpath))
+            web_id, rel = m.group(1), urllib.parse.unquote(m.group(2))
+            fpath = os.path.normpath(os.path.join(extract_dir(web_id), rel))
+            if fpath.startswith(extract_dir(web_id)) and os.path.exists(fpath):
+                return self._serve_file(web_id, fpath, os.path.basename(fpath), os.path.getsize(fpath))
             return self._send(404, b"gone", "text/plain")
 
         log(f"404 path={self.path!r}")
