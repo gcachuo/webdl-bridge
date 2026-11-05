@@ -679,7 +679,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         if body:
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client gave up waiting (slow upstream); nothing to do
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
