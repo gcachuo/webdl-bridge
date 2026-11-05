@@ -37,6 +37,7 @@ JACKETT_APIKEY = os.environ["JACKETT_APIKEY"]
 INDEXERS = [i.strip() for i in os.environ["INDEXERS"].split(",") if i.strip()]
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "http://localhost:4700").rstrip("/")
 RESOLVE_TIMEOUT = int(os.environ.get("RESOLVE_TIMEOUT", "300"))
+RESOLVE_FAILFAST = int(os.environ.get("RESOLVE_FAILFAST", "15"))
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 STATE_FILE = os.path.join(DATA_DIR, "links.json")
 TORZNAB_TIMEOUT = int(os.environ.get("TORZNAB_TIMEOUT", "10"))
@@ -598,7 +599,8 @@ def do_resolve(link, ctx=None):
             return "files", (web_id, files)
 
     item, web_id = ensure_webdl(link)
-    deadline = time.time() + RESOLVE_TIMEOUT
+    t0 = time.time()
+    deadline = t0 + RESOLVE_TIMEOUT
     last_state = None
     while True:
         if item is None:
@@ -625,6 +627,10 @@ def do_resolve(link, ctx=None):
                 last_state = st
             if any(x in st.lower() for x in ("failed", "error", "deleted", "expired")):
                 return None, f"torbox-state:{st}"
+            # fail fast: actively downloading on TorBox -> tell client to retry
+            # instead of holding the request for the whole resolve timeout
+            if time.time() - t0 > RESOLVE_FAILFAST and "download" in st.lower():
+                return None, f"downloading:{st}"
         if time.time() > deadline:
             return None, f"downloading:{last_state or 'unknown'}"
         time.sleep(5)
