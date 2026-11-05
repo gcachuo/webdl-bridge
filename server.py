@@ -256,7 +256,7 @@ def is_resolver(url):
 
 
 def resolve_gate(url):
-    """Emulate a link-gate countdown (/go/<id>) -> real destination URL."""; s
+    """Emulate a link-gate countdown (/go/<id>) -> real destination URL."""
     cj = http.cookiejar.CookieJar()
     op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
 
