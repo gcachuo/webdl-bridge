@@ -419,9 +419,9 @@ def streams_for(media_type, req_id):
         return None
 
     futures = [_pool.submit(live_web_id, it) for it in found]
-    ready = [f.result() is not None for f in futures]
+    ready = dict(zip(map(id, found), (f.result() is not None for f in futures)))
     # items already on TorBox first: mirrors needing a fresh download last
-    found = [it for _, it in sorted(zip(ready, found), key=lambda t: not t[0])]
+    found = sorted(found, key=lambda it: not ready[id(it)])
     log(f"found {len(found)} hoster items for '{name}'")
 
     streams = []
@@ -434,6 +434,7 @@ def streams_for(media_type, req_id):
                 "name": f"⚡WebDL {it.get('indexer','')}".strip(),
                 "title": f"{it['title']}\n{tag}{host}" + (f" • 💾{size}" if size else ""),
                 "url": f"{PUBLIC_BASE}/r/{b64e(it['link'] + '|' + req_id)}",
+                "behaviorHints": {"service": "torbox", "cached": ready.get(id(it), False)},
             }
         )
         if PREFETCH and len(streams) == 1:
