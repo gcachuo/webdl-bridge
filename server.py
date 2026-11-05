@@ -308,6 +308,19 @@ def fmt_size(n):
     return ""
 
 
+def create_webdl(link):
+    """createwebdownload with 429 backoff."""
+    for wait in (0, 10, 30, 60):
+        if wait:
+            time.sleep(wait)
+        try:
+            return http_post_form("https://api.torbox.app/v1/api/webdl/createwebdownload", {"link": link})
+        except RuntimeError as e:
+            if "HTTP 429" not in str(e):
+                raise
+    raise RuntimeError("HTTP 429 after retries")
+
+
 def prefetch(link):
     """Fire-and-forget: warm the whole chain (gate -> webdl -> extraction)
     so /r/ answers fast when the player/ffprobe hits it."""
@@ -331,7 +344,7 @@ def prefetch(link):
             _links[link] = {"web_id": None, "prefetch": True}
     if fresh:
         try:
-            res = http_post_form("https://api.torbox.app/v1/api/webdl/createwebdownload", {"link": link})
+            res = create_webdl(link)
             web_id = (res.get("data") or {}).get("webdownload_id")
             with _lock:
                 if web_id:
@@ -546,7 +559,7 @@ def ensure_webdl(link):
         except Exception:
             pass
     log(f"creating webdl for {link[:80]}")
-    res = http_post_form("https://api.torbox.app/v1/api/webdl/createwebdownload", {"link": link})
+    res = create_webdl(link)
     web_id = (res.get("data") or {}).get("webdownload_id")
     if not web_id:
         raise RuntimeError(res.get("detail") or res.get("error") or "rejected")
