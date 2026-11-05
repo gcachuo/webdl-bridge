@@ -17,6 +17,7 @@ resolve step usually hits an already-downloaded file.
 
 import base64
 import concurrent.futures
+import http.cookiejar
 import json
 import os
 import re
@@ -45,6 +46,11 @@ UA = "webdl-bridge/1.0"
 
 PLAYABLE = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".webm")
 ARCHIVE = (".rar", ".zip", ".7z", ".tar", ".tar.gz", ".tgz", ".001")
+
+# Link-gate domains resolved here instead of via TorBox allowlist.
+# todopaste /go/<id>: countdown gate -> POST /activity heartbeats -> /complete
+RESOLVER_HOSTS = {"todopaste.com"}
+GATE_TIMEOUT = int(os.environ.get("GATE_TIMEOUT", "90"))
 
 _links = {}          # link -> {"web_id": int, "file": name}
 _jobs = {}           # link -> threading.Event (in-flight resolve)
@@ -143,9 +149,27 @@ def ext_of(path):
 
 
 def cinemeta_meta(media_type, imdb_id):
-    url = f"https://v3-cinemeta.strem.io/meta/{'series' if media_type == 'series' else 'movie'}/{imdb_id}.json"
+    """Resolve title/year via TMDB /find (imdb external id)."""
+    api = os.environ.get("TMDB_API", "")
+    if api:
+        try:
+            data = json.loads(http_get(
+                f"https://api.themoviedb.org/3/find/{imdb_id}?api_key={api}&external_source=imdb_id&language=es-MX",
+                timeout=8))
+            results = (data.get("tv_results") or []) if media_type == "series" else (data.get("movie_results") or [])
+            if results:
+                r = results[0]
+                name = r.get("name") or r.get("title") or ""
+                orig = r.get("original_name") or r.get("original_title") or ""
+                date = r.get("first_air_date") or r.get("release_date") or ""
+                return {"name": name, "original_name": orig, "year": date[:4]}
+        except Exception as e:
+            log(f"tmdb find failed for {imdb_id}: {e}")
     try:
-        return json.loads(http_get(url, timeout=5)).get("meta") or {}
+        d = json.loads(http_get(
+            f"https://v3-cinemeta.strem.io/meta/{'series' if media_type == 'series' else 'movie'}/{imdb_id}.json",
+            timeout=8))
+        return d.get("meta") or {}
     except Exception as e:
         log(f"cinemeta failed for {imdb_id}: {e}")
         return {}
@@ -222,6 +246,50 @@ def supported_host(url):
     return any(host == d or host.endswith("." + d) for d in _hosters["domains"])
 
 
+def is_resolver(url):
+    host = host_of(url)
+    return any(host == d or host.endswith("." + d) for d in RESOLVER_HOSTS)
+
+
+def resolve_gate(url):
+    """Emulate a link-gate countdown (todopaste /go/<id>) -> real destination URL."""
+    cj = http.cookiejar.CookieJar()
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+    def greq(u, data=None, headers=None):
+        r = urllib.request.Request(u, data=data, headers={"User-Agent": UA, **(headers or {})})
+        return op.open(r, timeout=30)
+
+    html = greq(url).read().decode("utf8", "replace")
+    tok = re.search(r'session_token":"([0-9A-Za-z]{64})"', html)
+    csrf = re.search(r'csrf-token" content="([^"]+)"', html)
+    act = re.search(r'endpoint = "([^"]+activity)"', html)
+    comp = re.search(r'completeUrl="([^"]+)"', html)
+    if not (tok and csrf and act and comp):
+        raise RuntimeError("gate page format not recognized")
+    tok, csrf = tok.group(1), csrf.group(1)
+    act = act.group(1).replace("\\/", "/")
+    comp = comp.group(1).replace("\\/", "/")
+    headers = {
+        "Content-Type": "application/json",
+        "X-CSRF-TOKEN": csrf,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    deadline = time.time() + GATE_TIMEOUT
+    while time.time() < deadline:
+        body = json.dumps({"session_token": tok, "event": "heartbeat", "active_delta": 4}).encode()
+        res = json.loads(greq(act, data=body, headers=headers).read())
+        if res.get("can_complete"):
+            out = json.loads(greq(comp, data=json.dumps({"session_token": tok}).encode(), headers=headers).read())
+            dest = (out or {}).get("destination_url")
+            if dest and dest.startswith("http"):
+                log(f"gate resolved -> {dest[:80]}")
+                return dest
+            raise RuntimeError(f"gate complete rejected: {str(out)[:120]}")
+        time.sleep(4)
+    raise RuntimeError("gate timeout")
+
+
 def fmt_size(n):
     try:
         n = int(n)
@@ -275,13 +343,18 @@ def streams_for(media_type, req_id):
     if not name:
         return []
 
+    # Search original title first (site titles are often English), then localized
+    orig = (meta.get("original_name") or "").strip()
+    titles = [t for t in dict.fromkeys([orig, name]) if t]
+
     queries = []
     for indexer in INDEXERS:
-        if media_type == "series" and season is not None:
-            queries.append((indexer, {"t": "tvsearch", "q": name, "season": season, "ep": episode}))
-        else:
-            queries.append((indexer, {"t": "search", "q": f"{name} {year}".strip()}))
-            queries.append((indexer, {"t": "search", "q": name}))
+        for t in titles:
+            if media_type == "series" and season is not None:
+                queries.append((indexer, {"t": "tvsearch", "q": t, "season": season, "ep": episode}))
+            else:
+                queries.append((indexer, {"t": "search", "q": f"{t} {year}".strip()}))
+                queries.append((indexer, {"t": "search", "q": t}))
 
     seen, found = set(), []
     futures = [_pool.submit(torznab_items, ix, p) for ix, p in queries]
@@ -291,7 +364,7 @@ def streams_for(media_type, req_id):
         except Exception:
             res = []
         for it in res:
-            if it["link"] in seen or not supported_host(it["link"]):
+            if it["link"] in seen or (not supported_host(it["link"]) and not is_resolver(it["link"])):
                 continue
             seen.add(it["link"])
             found.append(it)
@@ -422,6 +495,19 @@ def do_resolve(link):
     """Blocking resolve. Returns (kind, target): kind 'redirect'|'file'."""
     with _lock:
         entry = _links.get(link) or {}
+    # Resolve link gates (e.g. todopaste /go/) to the real hoster URL first;
+    # cache the mapping so replays skip the countdown.
+    if is_resolver(link):
+        if entry.get("gate_to"):
+            link = entry["gate_to"]
+        else:
+            real = resolve_gate(link)
+            with _lock:
+                _links[link] = {"gate_to": real, "gate_from": link}
+                save_links()
+            link = real
+        with _lock:
+            entry = _links.get(link) or {}
     # already extracted?
     web_id = entry.get("web_id")
     if web_id and entry.get("file"):
