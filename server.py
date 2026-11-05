@@ -627,10 +627,10 @@ def do_resolve(link, ctx=None):
                 last_state = st
             if any(x in st.lower() for x in ("failed", "error", "deleted", "expired")):
                 return None, f"torbox-state:{st}"
-            # fail fast: actively downloading on TorBox -> tell client to retry
-            # instead of holding the request for the whole resolve timeout
-            if time.time() - t0 > RESOLVE_FAILFAST and "download" in st.lower():
-                return None, f"downloading:{st}"
+            # fail fast: still being processed on TorBox (downloading/decrypting/
+            # queued/...) -> serve placeholder instead of holding the request
+            if time.time() - t0 > RESOLVE_FAILFAST:
+                return None, f"downloading:{st or 'unknown'}"
         if time.time() > deadline:
             return None, f"downloading:{last_state or 'unknown'}"
         time.sleep(5)
