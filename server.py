@@ -17,6 +17,7 @@ resolve step usually hits an already-downloaded file.
 
 import base64
 import concurrent.futures
+import difflib
 import http.cookiejar
 import json
 import os
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -37,7 +39,7 @@ JACKETT_APIKEY = os.environ["JACKETT_APIKEY"]
 INDEXERS = [i.strip() for i in os.environ["INDEXERS"].split(",") if i.strip()]
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "http://localhost:4700").rstrip("/")
 RESOLVE_TIMEOUT = int(os.environ.get("RESOLVE_TIMEOUT", "300"))
-RESOLVE_FAILFAST = int(os.environ.get("RESOLVE_FAILFAST", "15"))
+RESOLVE_FAILFAST = int(os.environ.get("RESOLVE_FAILFAST", "30"))
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 STATE_FILE = os.path.join(DATA_DIR, "links.json")
 TORZNAB_TIMEOUT = int(os.environ.get("TORZNAB_TIMEOUT", "10"))
@@ -154,30 +156,45 @@ def ext_of(path):
     return os.path.splitext(p)[1]
 
 
-def cinemeta_meta(media_type, imdb_id):
-    """Resolve title/year via TMDB /find (imdb external id)."""
+def _tmdb_meta_fields(r):
+    name = r.get("name") or r.get("title") or ""
+    orig = r.get("original_name") or r.get("original_title") or ""
+    date = r.get("first_air_date") or r.get("release_date") or ""
+    return {"name": name, "original_name": orig, "year": date[:4]}
+
+
+def cinemeta_meta(media_type, ext_id):
+    """Resolve title/year via TMDB (tmdb:<id> direct or tt<imdb> via /find)."""
     api = os.environ.get("TMDB_API", "")
     if api:
-        try:
-            data = json.loads(http_get(
-                f"https://api.themoviedb.org/3/find/{imdb_id}?api_key={api}&external_source=imdb_id&language=es-MX",
-                timeout=8))
-            results = (data.get("tv_results") or []) if media_type == "series" else (data.get("movie_results") or [])
-            if results:
-                r = results[0]
-                name = r.get("name") or r.get("title") or ""
-                orig = r.get("original_name") or r.get("original_title") or ""
-                date = r.get("first_air_date") or r.get("release_date") or ""
-                return {"name": name, "original_name": orig, "year": date[:4]}
-        except Exception as e:
-            log(f"tmdb find failed for {imdb_id}: {e}")
+        if ext_id.startswith("tmdb:"):
+            tmdb_id = ext_id.split(":", 1)[1]
+            ep_type = "tv" if media_type == "series" else "movie"
+            try:
+                data = json.loads(http_get(
+                    f"https://api.themoviedb.org/3/{ep_type}/{tmdb_id}?api_key={api}&language=es-MX",
+                    timeout=8))
+                if data:
+                    return _tmdb_meta_fields(data)
+            except Exception as e:
+                log(f"tmdb lookup failed for {ext_id}: {e}")
+        else:
+            try:
+                data = json.loads(http_get(
+                    f"https://api.themoviedb.org/3/find/{ext_id}?api_key={api}&external_source=imdb_id&language=es-MX",
+                    timeout=8))
+                results = (data.get("tv_results") or []) if media_type == "series" else (data.get("movie_results") or [])
+                if results:
+                    return _tmdb_meta_fields(results[0])
+            except Exception as e:
+                log(f"tmdb find failed for {ext_id}: {e}")
     try:
         d = json.loads(http_get(
-            f"https://v3-cinemeta.strem.io/meta/{'series' if media_type == 'series' else 'movie'}/{imdb_id}.json",
+            f"https://v3-cinemeta.strem.io/meta/{'series' if media_type == 'series' else 'movie'}/{ext_id}.json",
             timeout=8))
         return d.get("meta") or {}
     except Exception as e:
-        log(f"cinemeta failed for {imdb_id}: {e}")
+        log(f"cinemeta failed for {ext_id}: {e}")
         return {}
 
 
@@ -213,7 +230,12 @@ def torznab_items(indexer, params):
             kind = "video"   # hoster page URLs without extension: let TorBox decide
         else:
             continue
-        items.append({"title": tag("title"), "link": link, "size": tag("size"), "kind": kind, "indexer": indexer})
+        cats = [
+            a.attrib.get("value", "")
+            for a in it.findall("{http://torznab.com/schemas/2015/feed}attr")
+            if a.attrib.get("name") == "category" and a.attrib.get("value")
+        ]
+        items.append({"title": tag("title"), "link": link, "size": tag("size"), "kind": kind, "indexer": indexer, "cats": cats})
     return items
 
 
@@ -363,6 +385,132 @@ def prefetch(link):
     resolve_async(link)
 
 
+_EPISODE_MARKER_RE = re.compile(
+    r"(?:\b[st]0*\d+\s*e0*\d+\b|\be0*\d+\s*-\s*e?0*\d+\b)", re.I
+)
+_RELEASE_SPLIT_RE = re.compile(
+    r"(?:[\(\[]\s*(?:19\d{2}|20\d{2})\s*[\)\]]"
+    r"|(?<=[\s._-])(?:19\d{2}|20\d{2})(?=[\s._-]+(?:full[\s._-]*hd|2160p|1080p|720p|576p|480p|4k|web[\s._-]*dl|webrip|hdrip|dvdrip|bdrip|brrip|bluray|blu[\s._-]*ray|remux|hdtv|latino|castellano|spanish|english|dual|mega|mediafire|gdrive|1fichier|megaup)\b)"
+    r"|\b(?:full[\s._-]*hd|2160p|1080p|720p|576p|480p|4k|web[\s._-]*dl|webrip|hdrip|dvdrip|bdrip|brrip|bluray|blu[\s._-]*ray|remux|hdtv|s\d{1,2}e\d{1,3}|t\d{1,2}[\s._-]*e\d{1,3}|temporada[\s._-]*\d+|latino|castellano)\b)",
+    re.I,
+)
+
+
+def _item_fl_name(it):
+    """Decode optional ?fl= filename from a torznab link."""
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(it["link"]).query)
+    if not qs.get("fl"):
+        return ""
+    try:
+        return b64d(qs["fl"][0])
+    except Exception:
+        return ""
+
+
+def _norm_title(s):
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^\w\s]", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def item_matches_request(it, media_type, titles, year):
+    """Reject torznab items for wrong category, episode packs in movies, wrong year, or wrong title."""
+    cats = it.get("cats") or []
+    if cats:
+        has_movie = any(c.startswith("2") for c in cats)
+        has_tv = any(c.startswith("5") for c in cats)
+        if media_type == "movie" and has_tv and not has_movie:
+            return False
+        if media_type == "series" and has_movie and not has_tv:
+            return False
+
+    raw_title = (it.get("title") or "").strip()
+    fl_name = _item_fl_name(it)
+    if media_type == "movie":
+        if _EPISODE_MARKER_RE.search(raw_title) or _EPISODE_MARKER_RE.search(fl_name):
+            return False
+
+    raw = re.sub(r"-[A-Za-z0-9_]+$", "", raw_title)
+    m = _RELEASE_SPLIT_RE.search(raw)
+    cand_raw = raw[:m.start()] if m else raw
+    ym = re.search(r"(19\d{2}|20\d{2})", raw[m.start():]) if m else None
+    item_year = int(ym.group(1)) if ym else None
+    if year and year.isdigit() and item_year is not None:
+        req_year = int(year)
+        if media_type == "movie" and abs(item_year - req_year) > 1:
+            return False
+        if media_type == "series" and item_year < req_year - 1:
+            return False
+
+    cand = _norm_title(cand_raw)
+    if not cand:
+        return False
+    cand_nums = re.findall(r"\b\d+\b", cand)
+    for t in titles:
+        target = _norm_title(t)
+        if not target:
+            continue
+        if cand == target:
+            return True
+        if cand_nums != re.findall(r"\b\d+\b", target):
+            continue
+        if difflib.SequenceMatcher(None, cand, target).ratio() >= 0.92:
+            return True
+    return False
+
+
+def _extract_season_ep(it):
+    """Extract (item_season, ep_range) from ?fl= filename or item title."""
+    fl = _item_fl_name(it) or it.get("title", "")
+    # Season: T1, S01, S1 - 02, 1x02
+    sm = re.search(r"\b(?:t|s)0*(\d+)\b|\bs0*(\d+)\s*e\d+\b|\b0*(\d+)x\d+\b", fl, re.I)
+    item_season = int(next(g for g in sm.groups() if g is not None)) if sm else None
+    # Episode range: E01 - 03, E01-E03
+    rm = re.search(r"\be0*(\d+)\s*-\s*e?0*(\d+)\b", fl, re.I)
+    if rm:
+        return item_season, (int(rm.group(1)), int(rm.group(2)))
+    # Single episode: S01E02, E13, S4 - 02, 1x02, Cap 02
+    em = re.search(r"\bs0*\d+\s*(?:e|\s*-\s*)0*(\d+)\b|\be0*(\d+)\b|\b\d+x0*(\d+)\b|\bcap(?:itulo)?\s*0*(\d+)\b", fl, re.I)
+    if em:
+        ep = int(next(g for g in em.groups() if g is not None))
+        return item_season, (ep, ep)
+    return item_season, None
+
+
+def resolve_target_episode(items, season, episode):
+    """Determine target episode number supporting absolute series numbering (e.g. MundoToon T2 E13..)."""
+    if season is None or episode is None or season <= 1:
+        return episode
+    parsed = [_extract_season_ep(it) for it in items]
+    prev_max = max((rng[1] for s, rng in parsed if s is not None and s < season and rng), default=0)
+    cur_min = min((rng[0] for s, rng in parsed if s == season and rng), default=0)
+    if cur_min > 1 and prev_max > 0 and cur_min > prev_max:
+        offset = prev_max if cur_min == prev_max + 1 else (cur_min - 1)
+        return offset + episode
+    return episode
+
+
+def filter_series_items(found, season, episode):
+    """Filter items by season and mapped episode number per indexer."""
+    target_by_ix = {
+        ix: resolve_target_episode([x for x in found if x.get("indexer") == ix], season, episode)
+        for ix in {x.get("indexer") for x in found}
+    }
+    out = []
+    for it in found:
+        s, rng = _extract_season_ep(it)
+        if season is not None and s is not None and s != season:
+            continue
+        target_ep = target_by_ix.get(it.get("indexer"), episode)
+        if target_ep is not None and rng is not None and not (rng[0] <= target_ep <= rng[1]):
+            continue
+        it_copy = dict(it)
+        it_copy["_target_ep"] = target_ep
+        out.append(it_copy)
+    return out
+
+
 def streams_for(media_type, req_id):
     with _lock:
         hit = _stream_cache.get(req_id)
@@ -370,11 +518,16 @@ def streams_for(media_type, req_id):
             return hit[1]
 
     parts = req_id.split(":")
-    imdb_id = parts[0]
-    season = int(parts[1]) if len(parts) > 1 else None
-    episode = int(parts[2]) if len(parts) > 2 else None
+    if req_id.startswith("tmdb:"):
+        ext_id = f"{parts[0]}:{parts[1]}"
+        season = int(parts[2]) if len(parts) > 2 else None
+        episode = int(parts[3]) if len(parts) > 3 else None
+    else:
+        ext_id = parts[0]
+        season = int(parts[1]) if len(parts) > 1 else None
+        episode = int(parts[2]) if len(parts) > 2 else None
 
-    meta = cinemeta_meta(media_type, imdb_id)
+    meta = cinemeta_meta(media_type, ext_id)
     name = meta.get("name") or ""
     year = (meta.get("year") or "")[:4] or (meta.get("releaseInfo") or "")[:4]
     log(f"stream req {req_id} -> '{name}' {year} S{season}E{episode}")
@@ -389,12 +542,12 @@ def streams_for(media_type, req_id):
     for indexer in INDEXERS:
         for t in titles:
             if media_type == "series" and season is not None:
-                queries.append((indexer, {"t": "tvsearch", "q": t, "season": season, "ep": episode}))
+                queries.append((indexer, {"t": "tvsearch", "q": t, "season": season, "ep": episode, "limit": 500}))
             else:
-                queries.append((indexer, {"t": "search", "q": f"{t} {year}".strip()}))
-                queries.append((indexer, {"t": "search", "q": t}))
+                queries.append((indexer, {"t": "search", "q": f"{t} {year}".strip(), "limit": 500}))
+                queries.append((indexer, {"t": "search", "q": t, "limit": 500}))
 
-    seen, found = set(), []
+    seen, found, skipped = set(), [], 0
     futures = [_pool.submit(torznab_items, ix, p) for ix, p in queries]
     for f in futures:
         try:
@@ -405,7 +558,15 @@ def streams_for(media_type, req_id):
             if it["link"] in seen or (not supported_host(it["link"]) and not is_resolver(it["link"])):
                 continue
             seen.add(it["link"])
+            if not item_matches_request(it, media_type, titles, year):
+                skipped += 1
+                continue
             found.append(it)
+    if skipped:
+        log(f"filtered {skipped} mismatched items for '{name}'")
+
+    if media_type == "series" and season is not None:
+        found = filter_series_items(found, season, episode)
 
     def dest_entry(it):
         """Return (real_link, entry) for the torznab item, following gate_to."""
@@ -439,41 +600,30 @@ def streams_for(media_type, req_id):
     found = sorted(found, key=lambda it: not ready[id(it)])
     log(f"found {len(found)} hoster items for '{name}'")
 
-    def pack_range(it):
-        """(start, end) episode range if the link is a season pack (via ?fl= filename)."""
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(it["link"]).query)
-        try:
-            fl = b64d(qs["fl"][0]) if qs.get("fl") else it["title"]
-        except Exception:
-            fl = it["title"]
-        m = re.search(r"e0*(\d+)\s*-\s*0*(\d+)", fl, re.I)
-        return (int(m.group(1)), int(m.group(2))) if m else None
-
     streams = []
     for it in found:
-        if episode is not None:
-            rng = pack_range(it)
-            if rng and not (rng[0] <= episode <= rng[1]):
-                continue  # season pack doesn't contain this episode
         host = host_of(it["link"])
         size = fmt_size(it["size"])
         tag = "📦" if it["kind"] == "archive" else "🌐"
+        target_ep = it.get("_target_ep", episode)
+        ep_ctx = f"{ext_id}:{season}:{target_ep}" if (season is not None and target_ep is not None) else req_id
         streams.append(
             {
                 "name": f"⚡WebDL {it.get('indexer','')}".strip(),
                 "title": f"{it['title']}\n{tag}{host}" + (f" • 💾{size}" if size else ""),
-                "url": f"{PUBLIC_BASE}/r/{b64e(it['link'] + '|' + req_id)}",
+                "url": f"{PUBLIC_BASE}/r/{b64e(it['link'] + '|' + ep_ctx)}",
                 "behaviorHints": {"service": "torbox", "cached": ready.get(id(it), False)},
             }
         )
-        if PREFETCH and len(streams) == 1:
-            # only warm the first item: the rest are usually mirrors of the same file
+        if PREFETCH and len(streams) <= 2:
+            # warm the primary and backup mirrors for fast fallback on playback
             _pool.submit(prefetch, it["link"])
 
-    with _lock:
-        _stream_cache[req_id] = (time.time(), streams)
-        if len(_stream_cache) > 500:
-            _stream_cache.clear()
+    if streams:
+        with _lock:
+            _stream_cache[req_id] = (time.time(), streams)
+            if len(_stream_cache) > 500:
+                _stream_cache.clear()
     return streams
 
 
@@ -544,10 +694,17 @@ def download_and_extract(web_id, file_id, file_name=None):
     try:
         subprocess.run(["bsdtar", "-xf", archive_path, "-C", out_dir], check=True, timeout=600)
     except subprocess.CalledProcessError:
-        # likely encrypted (bsdtar can't do crypto): try unrar with known passwords
+        # likely encrypted (bsdtar can't do crypto): try unrar or 7z with known passwords
+        sevenzip = shutil.which("7zz") or shutil.which("7z")
+        is_7z = archive_path.lower().endswith(".7z")
         for pw in ARCHIVE_PASSWORDS:
-            r = subprocess.run(["unrar", "x", "-o+", f"-p{pw}", archive_path, out_dir + "/"],
-                               timeout=600, capture_output=True)
+            if is_7z and sevenzip:
+                cmd = [sevenzip, "x", "-y", f"-p{pw}", f"-o{out_dir}", archive_path]
+            elif is_7z:
+                cmd = ["bsdtar", "-xf", archive_path, "-C", out_dir, f"--passphrase={pw}"]
+            else:
+                cmd = ["unrar", "x", "-o+", f"-p{pw}", archive_path, out_dir + "/"]
+            r = subprocess.run(cmd, timeout=600, capture_output=True)
             if r.returncode == 0:
                 break
         else:
@@ -591,6 +748,7 @@ def pick_episode(files, ctx):
     ss, ee = int(m.group(1)), int(m.group(2))
     pats = [
         rf"s0*{ss}e0*{ee}(?!\d)",
+        rf"s?0*{ss}x0*{ee}(?!\d)",
         rf"(?<![a-z0-9])e0*{ee}(?!\d)",
         rf"^0*{ee}\s*[-_.]",
         rf"(?<!\d)0*{ee}(?!\d)",
@@ -719,7 +877,7 @@ MANIFEST = {
     "description": "Jackett torznab hoster links resolved through TorBox web downloads (rar/zip extracted server-side).",
     "resources": ["stream"],
     "types": ["movie", "series"],
-    "idPrefixes": ["tt"],
+    "idPrefixes": ["tmdb:", "tt"],
     "catalogs": [],
 }
 
