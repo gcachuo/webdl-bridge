@@ -43,7 +43,7 @@ RESOLVE_FAILFAST = int(os.environ.get("RESOLVE_FAILFAST", "5"))
 BG_RESOLVE_TIMEOUT = int(os.environ.get("BG_RESOLVE_TIMEOUT", str(max(RESOLVE_TIMEOUT, 900))))
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 STATE_FILE = os.path.join(DATA_DIR, "links.json")
-TORZNAB_TIMEOUT = int(os.environ.get("TORZNAB_TIMEOUT", "7"))
+TORZNAB_TIMEOUT = int(os.environ.get("TORZNAB_TIMEOUT", "8"))
 STREAM_TTL = int(os.environ.get("STREAM_TTL", "900"))
 PREFETCH = os.environ.get("PREFETCH", "true").lower() == "true"
 UA = "webdl-bridge/1.0"
@@ -200,13 +200,15 @@ def cinemeta_meta(media_type, ext_id):
         return {}
 
 
-def torznab_items(indexer, params):
+def torznab_items(indexer, params, errors=None):
     qs = {"apikey": JACKETT_APIKEY, "extended": "1", "limit": "100", **params}
     url = f"{JACKETT_URL}/api/v2.0/indexers/{indexer}/results/torznab/api?{urllib.parse.urlencode(qs)}"
     try:
         xml = http_get(url, timeout=TORZNAB_TIMEOUT)
     except Exception as e:
         log(f"torznab {indexer} {params.get('q','')!r} failed: {e}")
+        if errors is not None:
+            errors.append(indexer)
         return []
     try:
         root = ET.fromstring(xml)
@@ -363,14 +365,19 @@ _RELEASE_SPLIT_RE = re.compile(
 
 
 def _item_fl_name(it):
-    """Decode optional ?fl= filename from a torznab link."""
-    qs = urllib.parse.parse_qs(urllib.parse.urlparse(it.get("link", "")).query)
-    if not qs.get("fl"):
-        return ""
-    try:
-        return b64d(qs["fl"][0])
-    except Exception:
-        return ""
+    """Decode optional ?fl= filename from a torznab link, or fallback to URL path filename."""
+    parsed = urllib.parse.urlparse(it.get("link", ""))
+    qs = urllib.parse.parse_qs(parsed.query)
+    if qs.get("fl"):
+        try:
+            return b64d(qs["fl"][0])
+        except Exception:
+            pass
+    for seg in reversed(urllib.parse.unquote(parsed.path or "").split("/")):
+        low = seg.lower()
+        if any(low.endswith(ext) for ext in PLAYABLE + ARCHIVE):
+            return seg
+    return ""
 
 
 def _norm_title(s):
@@ -546,6 +553,21 @@ def item_ready_state(it):
     return (1, False)
 
 
+_SEASON_PACK_LABEL_RE = re.compile(
+    r"[.\s_-]*\btemporadas?\s*:?[.\s,_-]*\d+(?:[.\s,_-]+(?:y\b|&)?[.\s,_-]*\d+)*(?=[.\s_-]|$)",
+    re.I,
+)
+
+
+def clean_stream_title(raw_title):
+    """Sanitize release title so AIOStreams StreamParser/FileParser don't strip prefixes on ':' or misparse 'Temporadas: 1, 2 y 3' as episodes."""
+    t = _SEASON_PACK_LABEL_RE.sub("", raw_title or "")
+    t = t.replace(":", "")
+    t = re.sub(r"\.{2,}", ".", t)
+    t = re.sub(r"\s{2,}", " ", t)
+    return t.strip(" .")
+
+
 def streams_for(media_type, req_id):
     with _lock:
         hit = _stream_cache.get(req_id)
@@ -584,12 +606,13 @@ def streams_for(media_type, req_id):
                     queries.append((indexer, {"t": "search", "q": f"{t} {year}".strip(), "limit": 500}))
                     queries.append((indexer, {"t": "search", "q": t, "limit": 500}))
 
-        seen, found, skipped = set(), [], 0
-        futures = [_pool.submit(torznab_items, ix, p) for ix, p in queries]
+        seen, found, skipped, errors = set(), [], 0, []
+        futures = [_pool.submit(torznab_items, ix, p, errors) for ix, p in queries]
         for f in futures:
             try:
                 res = f.result(timeout=TORZNAB_TIMEOUT + 1)
             except Exception:
+                errors.append("timeout")
                 res = []
             for it in res:
                 if it["link"] in seen or (not supported_host(it["link"]) and not is_resolver(it["link"])):
@@ -606,8 +629,9 @@ def streams_for(media_type, req_id):
             found = filter_series_items(found, season, episode)
 
         if found:
+            cache_ts = (time.time() - STREAM_TTL + 60) if errors else time.time()
             with _lock:
-                _stream_cache[req_id] = (time.time(), (ext_id, season, episode, name, found))
+                _stream_cache[req_id] = (cache_ts, (ext_id, season, episode, name, found))
                 if len(_stream_cache) > 500:
                     _stream_cache.clear()
 
@@ -626,12 +650,18 @@ def streams_for(media_type, req_id):
         ep_ctx = f"{ext_id}:{season}:{target_ep}" if (season is not None and target_ep is not None) else req_id
         _, is_cached = states.get(id(it), (2, False))
         badge = "[TB+] ⚡" if is_cached else "[TB] ⏳"
+        clean_title = clean_stream_title(it.get("title", ""))
+        meta_line = f"{tag}{host}" + (f" • 💾{size}" if size else "") + " • 👤 1"
         streams.append(
             {
                 "name": f"{badge}WebDL {it.get('indexer','')}".strip(),
-                "title": f"{it['title']}\n{tag}{host}" + (f" • 💾{size}" if size else ""),
+                "title": f"{clean_title}\n{meta_line}",
                 "url": f"{PUBLIC_BASE}/r/{b64e(it['link'] + '|' + ep_ctx)}",
-                "behaviorHints": {"service": "torbox", "cached": is_cached},
+                "behaviorHints": {
+                    "service": "torbox",
+                    "cached": is_cached,
+                    "filename": clean_title,
+                },
             }
         )
         if PREFETCH and len(streams) <= 2:
