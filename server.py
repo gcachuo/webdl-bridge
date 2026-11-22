@@ -11,8 +11,8 @@ Endpoints:
 
 Latency budget: /stream answers within ~12s always (AIOStreams kills slow
 addons). Torznab queries run in parallel with hard timeouts and results are
-cached 15min. Hosters found are prefetched to TorBox in the background so the
-resolve step usually hits an already-downloaded file.
+cached 15min. Hosters are resolved on demand via TorBox (optional background
+prefetch via PREFETCH=true).
 """
 
 import base64
@@ -45,7 +45,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 STATE_FILE = os.path.join(DATA_DIR, "links.json")
 TORZNAB_TIMEOUT = int(os.environ.get("TORZNAB_TIMEOUT", "8"))
 STREAM_TTL = int(os.environ.get("STREAM_TTL", "900"))
-PREFETCH = os.environ.get("PREFETCH", "true").lower() == "true"
+PREFETCH = os.environ.get("PREFETCH", "false").lower() == "true"
 UA = "webdl-bridge/1.0"
 
 PLAYABLE = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".webm")
@@ -59,11 +59,14 @@ GATE_TIMEOUT = int(os.environ.get("GATE_TIMEOUT", "90"))
 ARCHIVE_PASSWORDS = [p.strip() for p in os.environ.get("ARCHIVE_PASSWORDS", "").split(",") if p.strip()]
 # keep extracted files ~as long as TorBox keeps the source (30d since last play)
 EXTRACT_TTL = int(os.environ.get("EXTRACT_TTL", str(30 * 86400)))
+FAILED_TTL = int(os.environ.get("FAILED_TTL", "21600"))
 
 _links = {}          # link -> {"web_id": int, "file": name}
 _jobs = {}           # link -> threading.Event (in-flight resolve)
 _extract_locks = {}  # web_id -> threading.Lock (dedup download+extract)
 _stream_cache = {}   # req_id -> (ts, streams)
+_failed = {}         # link -> ts of permanent resolve failure
+_season_meta_cache = {}  # (tmdb_id, season) -> (ts, episodes)
 _lock = threading.Lock()
 _pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 _bg_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
@@ -162,7 +165,7 @@ def _tmdb_meta_fields(r):
     name = r.get("name") or r.get("title") or ""
     orig = r.get("original_name") or r.get("original_title") or ""
     date = r.get("first_air_date") or r.get("release_date") or ""
-    return {"name": name, "original_name": orig, "year": date[:4]}
+    return {"name": name, "original_name": orig, "year": date[:4], "tmdb_id": r.get("id")}
 
 
 def cinemeta_meta(media_type, ext_id):
@@ -198,6 +201,62 @@ def cinemeta_meta(media_type, ext_id):
     except Exception as e:
         log(f"cinemeta failed for {ext_id}: {e}")
         return {}
+
+
+def tmdb_season_episodes(tmdb_id, season):
+    """Fetch and cache TMDB episode metadata (number + runtime) for a season."""
+    api = os.environ.get("TMDB_API", "")
+    if not (api and tmdb_id and season is not None):
+        return []
+    key = (int(tmdb_id), int(season))
+    with _lock:
+        hit = _season_meta_cache.get(key)
+        if hit and time.time() - hit[0] < 86400:
+            return hit[1]
+    try:
+        data = json.loads(http_get(
+            f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}?api_key={api}",
+            timeout=5,
+        ))
+        eps = [
+            {"episode_number": e.get("episode_number"), "runtime": e.get("runtime")}
+            for e in (data.get("episodes") or [])
+            if e.get("episode_number")
+        ]
+    except Exception as e:
+        log(f"tmdb season lookup failed for {tmdb_id} S{season}: {e}")
+        return []
+    with _lock:
+        _season_meta_cache[key] = (time.time(), eps)
+        if len(_season_meta_cache) > 500:
+            _season_meta_cache.clear()
+    return eps
+
+
+def build_paired_episode_map(episodes):
+    """Map short-segment episode numbers (<=15m) into combined ~22m broadcast episodes.
+    Returns (ep_map, paired_total, raw_total); ep_map is empty if season is not short-segment."""
+    if not episodes:
+        return {}, 0, 0
+    runtimes = [e.get("runtime") or 0 for e in episodes]
+    short_count = sum(1 for r in runtimes if 0 < r <= 15)
+    if short_count < len(episodes) * 0.6:
+        return {}, 0, len(episodes)
+    ep_map = {}
+    cur_ep = 0
+    acc = 0
+    for e in sorted(episodes, key=lambda x: x.get("episode_number", 0)):
+        num = e.get("episode_number")
+        if not num:
+            continue
+        rt = e.get("runtime") or 11
+        if acc == 0 or acc + rt > 26:
+            cur_ep += 1
+            acc = rt
+        else:
+            acc += rt
+        ep_map[num] = cur_ep
+    return ep_map, cur_ep, len(episodes)
 
 
 def torznab_items(indexer, params, errors=None):
@@ -347,9 +406,53 @@ def create_webdl(link):
     raise RuntimeError("HTTP 429 after retries")
 
 
+def _is_permanent_resolve_error(msg):
+    low = (msg or "").lower()
+    return any(tok in low for tok in (
+        "not a valid link",
+        "download_server_error",
+        "invalid_link",
+        "file not found",
+        "http 400:",
+        "http 404:",
+        "http 410:",
+        "http 422:",
+        "torbox-state:",
+        "no-video-in-archive",
+        "unsupported",
+    ))
+
+
+def is_failed(link):
+    if not link:
+        return False
+    with _lock:
+        ts = _failed.get(link)
+        if ts is None:
+            return False
+        if time.time() - ts < FAILED_TTL:
+            return True
+        _failed.pop(link, None)
+        return False
+
+
+def mark_failed(link):
+    if not link:
+        return
+    now = time.time()
+    with _lock:
+        _failed[link] = now
+        real = (_links.get(link) or {}).get("gate_to")
+        if real:
+            _failed[real] = now
+        if len(_failed) > 2000:
+            _failed.clear()
+
+
 def prefetch(link):
-    """Fire-and-forget: warm the whole chain (gate -> webdl -> extraction)
-    so /r/ answers fast when the player/ffprobe hits it."""
+    """Optional background warm (gate -> webdl -> extraction) when PREFETCH=true."""
+    if is_failed(link):
+        return
     start_resolve(link)
 
 
@@ -454,35 +557,60 @@ def _extract_season_ep(it):
     return item_season, None
 
 
-def resolve_target_episode(items, season, episode):
-    """Determine target episode number supporting absolute series numbering (e.g. MundoToon T2 E13..)."""
-    if season is None or episode is None or season <= 1:
+def resolve_target_episode(items, season, episode, season_pairing=None):
+    """Determine target episode number supporting absolute series numbering and paired short segments."""
+    if season is None or episode is None:
         return episode
     parsed = [_extract_season_ep(it) for it in items]
-    prev_max = max((rng[1] for s, rng in parsed if s is not None and s < season and rng), default=0)
-    cur_min = min((rng[0] for s, rng in parsed if s == season and rng), default=0)
-    if cur_min > 1 and prev_max > 0 and cur_min > prev_max:
-        offset = prev_max if cur_min == prev_max + 1 else (cur_min - 1)
-        return offset + episode
+    cur_mins = [rng[0] for s, rng in parsed if s == season and rng]
+    cur_maxs = [rng[1] for s, rng in parsed if s == season and rng]
+    cur_min = min(cur_mins, default=0)
+    cur_max = max(cur_maxs, default=0)
+
+    if season > 1:
+        prev_max = max((rng[1] for s, rng in parsed if s is not None and s < season and rng), default=0)
+        if cur_min > 1 and prev_max > 0 and cur_min > prev_max:
+            offset = prev_max if cur_min == prev_max + 1 else (cur_min - 1)
+            return offset + episode
+
+    if season_pairing:
+        ep_map, paired_total, raw_total = season_pairing
+        if ep_map and paired_total < raw_total and episode in ep_map:
+            if cur_min == 1 and 0 < cur_max <= paired_total + 1 and cur_max < raw_total * 0.75:
+                return ep_map[episode]
     return episode
 
 
-def filter_series_items(found, season, episode):
+def filter_series_items(found, season, episode, season_pairing=None):
     """Filter items by season and mapped episode number per indexer."""
+    by_ix = {}
+    for it in found:
+        by_ix.setdefault(it.get("indexer"), []).append(it)
     target_by_ix = {
-        ix: resolve_target_episode([x for x in found if x.get("indexer") == ix], season, episode)
-        for ix in {x.get("indexer") for x in found}
+        ix: resolve_target_episode(ix_items, season, episode, season_pairing=season_pairing)
+        for ix, ix_items in by_ix.items()
+    }
+    explicit_seasons_by_ix = {
+        ix: {s for it in ix_items for s, _ in [_extract_season_ep(it)] if s is not None}
+        for ix, ix_items in by_ix.items()
     }
     out = []
     for it in found:
+        ix = it.get("indexer")
         s, rng = _extract_season_ep(it)
-        if season is not None and s is not None and s != season:
-            continue
-        target_ep = target_by_ix.get(it.get("indexer"), episode)
+        if season is not None:
+            if s is not None and s != season:
+                continue
+            exp_seasons = explicit_seasons_by_ix.get(ix) or set()
+            if s is None and season in exp_seasons and len(exp_seasons) > 1:
+                continue
+        target_ep = target_by_ix.get(ix, episode)
         if target_ep is not None and rng is not None and not (rng[0] <= target_ep <= rng[1]):
             continue
         it_copy = dict(it)
         it_copy["_target_ep"] = target_ep
+        it_copy["_ep_mapped"] = (target_ep != episode)
+        it_copy["_season_matched"] = (s == season)
         out.append(it_copy)
     return out
 
@@ -500,6 +628,7 @@ def item_ready_state(it):
     tier 0: playable immediately (extracted on disk or direct playable video on TorBox) -> cached=True
     tier 1: in progress or archive on TorBox pending extraction -> cached=False
     tier 2: uncached / not started -> cached=False
+    tier 3: permanent failure / dead link -> cached=False
     """
     real, entry = dest_entry(it)
     web_id = entry.get("web_id")
@@ -517,6 +646,9 @@ def item_ready_state(it):
 
     if in_flight:
         return (1, False)
+
+    if is_failed(it.get("link", "")) or is_failed(real):
+        return (3, False)
 
     if not web_id:
         return (2, False)
@@ -574,7 +706,7 @@ def streams_for(media_type, req_id):
         cached_found = hit[1] if (hit and time.time() - hit[0] < STREAM_TTL) else None
 
     if cached_found:
-        ext_id, season, episode, name, found = cached_found
+        ext_id, season, episode, name, found, season_pairing = cached_found
     else:
         parts = req_id.split(":")
         if req_id.startswith("tmdb:"):
@@ -596,6 +728,10 @@ def streams_for(media_type, req_id):
         # Search original title first (site titles are often English), then localized
         orig = (meta.get("original_name") or "").strip()
         titles = [t for t in dict.fromkeys([orig, name]) if t]
+
+        season_fut = None
+        if media_type == "series" and season is not None and meta.get("tmdb_id"):
+            season_fut = _pool.submit(tmdb_season_episodes, meta.get("tmdb_id"), season)
 
         queries = []
         for indexer in INDEXERS:
@@ -625,30 +761,48 @@ def streams_for(media_type, req_id):
         if skipped:
             log(f"filtered {skipped} mismatched items for '{name}'")
 
+        season_pairing = ({}, 0, 0)
+        if season_fut:
+            try:
+                season_pairing = build_paired_episode_map(season_fut.result(timeout=6))
+            except Exception as e:
+                log(f"season metadata error for {req_id}: {e}")
+
         if media_type == "series" and season is not None:
-            found = filter_series_items(found, season, episode)
+            found = filter_series_items(found, season, episode, season_pairing=season_pairing)
 
         if found:
             cache_ts = (time.time() - STREAM_TTL + 60) if errors else time.time()
             with _lock:
-                _stream_cache[req_id] = (cache_ts, (ext_id, season, episode, name, found))
+                _stream_cache[req_id] = (cache_ts, (ext_id, season, episode, name, found, season_pairing))
                 if len(_stream_cache) > 500:
                     _stream_cache.clear()
 
     futures = [_pool.submit(item_ready_state, it) for it in found]
     states = dict(zip(map(id, found), (f.result() for f in futures)))
-    # tier 0 first (cached/ready), then tier 1 (in TorBox/extracting), then tier 2 (unprocessed)
-    found = sorted(found, key=lambda it: states[id(it)][0])
+    # tier 0 first (cached/ready), then tier 1, tier 2, tier 3 (failed)
+    # also prefer exact season matches over unspecific ones
+    found = sorted(found, key=lambda it: (states[id(it)][0], 0 if it.get("_season_matched") else 1))
     log(f"found {len(found)} hoster items for '{name}'")
 
+    ep_map, paired_total, raw_total = season_pairing if season_pairing else ({}, 0, 0)
+
     streams = []
+    prefetched_ix = set()
     for it in found:
         host = host_of(it.get("link", ""))
         size = fmt_size(it.get("size", 0))
         tag = "📦" if it.get("kind") == "archive" else "🌐"
         target_ep = it.get("_target_ep", episode)
-        ep_ctx = f"{ext_id}:{season}:{target_ep}" if (season is not None and target_ep is not None) else req_id
-        _, is_cached = states.get(id(it), (2, False))
+        if season is not None and target_ep is not None:
+            if not it.get("_ep_mapped") and ep_map and episode in ep_map and paired_total < raw_total:
+                ep_ctx = f"{ext_id}:{season}:{target_ep}~{ep_map[episode]}/{paired_total}/{raw_total}"
+            else:
+                ep_ctx = f"{ext_id}:{season}:{target_ep}"
+        else:
+            ep_ctx = req_id
+
+        tier, is_cached = states.get(id(it), (2, False))
         badge = "[TB+] ⚡" if is_cached else "[TB] ⏳"
         clean_title = clean_stream_title(it.get("title", ""))
         meta_line = f"{tag}{host}" + (f" • 💾{size}" if size else "") + " • 👤 1"
@@ -664,9 +818,11 @@ def streams_for(media_type, req_id):
                 },
             }
         )
-        if PREFETCH and len(streams) <= 2:
-            # warm the primary and backup mirrors for fast fallback on playback
-            prefetch(it["link"])
+        if PREFETCH and tier in (1, 2):
+            ix = it.get("indexer", "")
+            if ix not in prefetched_ix and len(prefetched_ix) < 2:
+                prefetched_ix.add(ix)
+                prefetch(it["link"])
 
     return streams
 
@@ -799,12 +955,26 @@ def ensure_webdl(link):
     return None, web_id
 
 
-def pick_episode(files, ctx):
-    """Choose the extracted file matching ctx 'ttID:S:E' (season packs hold all eps)."""
-    m = re.search(r":(\d+):(\d+)$", ctx or "")
+def _parse_ep_ctx(ctx):
+    """Parse context string 'ext_id:S:E' or 'ext_id:S:E~paired/paired_total/raw_total'.
+    Returns (season, ep, paired_info) where paired_info is (paired_ep, paired_total, raw_total) or None."""
+    if not ctx:
+        return None, None, None
+    m = re.search(r":(\d+):(\d+)(?:~(\d+)/(\d+)/(\d+))?$", ctx)
     if not m:
-        return None
+        return None, None, None
     ss, ee = int(m.group(1)), int(m.group(2))
+    paired_info = None
+    if m.group(3) and m.group(4) and m.group(5):
+        paired_info = (int(m.group(3)), int(m.group(4)), int(m.group(5)))
+    return ss, ee, paired_info
+
+
+def pick_episode(files, ctx):
+    """Choose the extracted file matching ctx (season packs hold all eps)."""
+    ss, ee, _ = _parse_ep_ctx(ctx)
+    if ss is None or ee is None:
+        return None
     pats = [
         rf"s0*{ss}e0*{ee}(?!\d)",
         rf"s?0*{ss}x0*{ee}(?!\d)",
@@ -891,9 +1061,21 @@ def do_resolve(link, ctx=None):
 
 
 def _pick_extracted(web_id, videos, ctx):
-    picked = pick_episode(videos, ctx)
+    ss, ee, paired_info = _parse_ep_ctx(ctx)
+    target_ctx = ctx
+    if paired_info and ss is not None and ee is not None:
+        paired_ep, paired_total, raw_total = paired_info
+        max_ep = 0
+        for v in videos:
+            s_v, rng_v = _extract_season_ep({"title": os.path.basename(v)})
+            if rng_v:
+                max_ep = max(max_ep, rng_v[1])
+        if 0 < max_ep <= paired_total + 1 and max_ep < raw_total * 0.75:
+            target_ctx = re.sub(r":\d+:\d+(?:~.*)?$", f":{ss}:{paired_ep}", ctx)
+
+    picked = pick_episode(videos, target_ctx)
     if not picked:
-        if len(videos) > 1 and re.search(r":\d+:\d+$", ctx or ""):
+        if len(videos) > 1 and re.search(r":\d+:\d+", ctx or ""):
             return None, "episode-not-in-pack"  # better than serving the wrong episode
         picked = max(videos, key=lambda v: os.path.getsize(os.path.join(extract_dir(web_id), v)))
     p = os.path.join(extract_dir(web_id), picked)
@@ -914,10 +1096,15 @@ def start_resolve(link):
     if owner:
         def run():
             try:
-                ev.result = do_resolve(link)
+                res = do_resolve(link)
+                ev.result = res
+                if res and res[0] is None and _is_permanent_resolve_error(res[1]):
+                    mark_failed(link)
             except Exception as e:
                 log(f"resolve error {link[:60]}: {e}")
                 ev.result = (None, "error")
+                if _is_permanent_resolve_error(str(e)):
+                    mark_failed(link)
             finally:
                 ev.set()
                 with _lock:
