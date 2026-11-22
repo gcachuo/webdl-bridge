@@ -39,10 +39,11 @@ JACKETT_APIKEY = os.environ["JACKETT_APIKEY"]
 INDEXERS = [i.strip() for i in os.environ["INDEXERS"].split(",") if i.strip()]
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "http://localhost:4700").rstrip("/")
 RESOLVE_TIMEOUT = int(os.environ.get("RESOLVE_TIMEOUT", "300"))
-RESOLVE_FAILFAST = int(os.environ.get("RESOLVE_FAILFAST", "30"))
+RESOLVE_FAILFAST = int(os.environ.get("RESOLVE_FAILFAST", "5"))
+BG_RESOLVE_TIMEOUT = int(os.environ.get("BG_RESOLVE_TIMEOUT", str(max(RESOLVE_TIMEOUT, 900))))
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 STATE_FILE = os.path.join(DATA_DIR, "links.json")
-TORZNAB_TIMEOUT = int(os.environ.get("TORZNAB_TIMEOUT", "10"))
+TORZNAB_TIMEOUT = int(os.environ.get("TORZNAB_TIMEOUT", "7"))
 STREAM_TTL = int(os.environ.get("STREAM_TTL", "900"))
 PREFETCH = os.environ.get("PREFETCH", "true").lower() == "true"
 UA = "webdl-bridge/1.0"
@@ -64,7 +65,8 @@ _jobs = {}           # link -> threading.Event (in-flight resolve)
 _extract_locks = {}  # web_id -> threading.Lock (dedup download+extract)
 _stream_cache = {}   # req_id -> (ts, streams)
 _lock = threading.Lock()
-_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+_pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+_bg_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 
 def log(msg):
@@ -346,43 +348,7 @@ def create_webdl(link):
 def prefetch(link):
     """Fire-and-forget: warm the whole chain (gate -> webdl -> extraction)
     so /r/ answers fast when the player/ffprobe hits it."""
-    if is_resolver(link):
-        with _lock:
-            real = (_links.get(link) or {}).get("gate_to")
-        if not real:
-            try:
-                real = resolve_gate(link)
-                with _lock:
-                    _links[link] = {"gate_to": real, "gate_from": link}
-                    save_links()
-            except Exception as e:
-                log(f"prefetch gate error {link[:70]}: {e}")
-                return
-        resolve_async(real)
-        return
-    with _lock:
-        fresh = link not in _links
-        if fresh:
-            _links[link] = {"web_id": None, "prefetch": True}
-    if fresh:
-        try:
-            res = create_webdl(link)
-            web_id = (res.get("data") or {}).get("webdownload_id")
-            with _lock:
-                if web_id:
-                    _links[link] = {"web_id": web_id}
-                    save_links()
-                    log(f"prefetch ok web_id={web_id} {link[:70]}")
-                else:
-                    _links.pop(link, None)
-                    log(f"prefetch rejected {link[:70]}: {res.get('detail') or res.get('error')}")
-                    return
-        except Exception as e:
-            with _lock:
-                _links.pop(link, None)
-            log(f"prefetch error {link[:70]}: {e}")
-            return
-    resolve_async(link)
+    start_resolve(link)
 
 
 _EPISODE_MARKER_RE = re.compile(
@@ -398,7 +364,7 @@ _RELEASE_SPLIT_RE = re.compile(
 
 def _item_fl_name(it):
     """Decode optional ?fl= filename from a torznab link."""
-    qs = urllib.parse.parse_qs(urllib.parse.urlparse(it["link"]).query)
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(it.get("link", "")).query)
     if not qs.get("fl"):
         return ""
     try:
@@ -462,16 +428,19 @@ def item_matches_request(it, media_type, titles, year):
 
 def _extract_season_ep(it):
     """Extract (item_season, ep_range) from ?fl= filename or item title."""
-    fl = _item_fl_name(it) or it.get("title", "")
-    # Season: T1, S01, S1 - 02, 1x02
-    sm = re.search(r"\b(?:t|s)0*(\d+)\b|\bs0*(\d+)\s*e\d+\b|\b0*(\d+)x\d+\b", fl, re.I)
+    if isinstance(it, str):
+        fl = it
+    else:
+        fl = _item_fl_name(it) or it.get("title", "")
+    # Season: T1, _T1.rar, S01, S1 - 02, 1x02
+    sm = re.search(r"(?:^|[\s._\-\[\(])(?:t|s)0*(\d+)(?=$|[\s._\-\]\)]|e\d+)|(?:^|[\s._\-\[\(])0*(\d+)x\d+\b", fl, re.I)
     item_season = int(next(g for g in sm.groups() if g is not None)) if sm else None
     # Episode range: E01 - 03, E01-E03
-    rm = re.search(r"\be0*(\d+)\s*-\s*e?0*(\d+)\b", fl, re.I)
+    rm = re.search(r"(?:^|[\s._\-\[\(]|\d)e0*(\d+)\s*-\s*e?0*(\d+)\b", fl, re.I)
     if rm:
         return item_season, (int(rm.group(1)), int(rm.group(2)))
     # Single episode: S01E02, E13, S4 - 02, 1x02, Cap 02
-    em = re.search(r"\bs0*\d+\s*(?:e|\s*-\s*)0*(\d+)\b|\be0*(\d+)\b|\b\d+x0*(\d+)\b|\bcap(?:itulo)?\s*0*(\d+)\b", fl, re.I)
+    em = re.search(r"(?:^|[\s._\-\[\(])s0*\d+\s*(?:e|\s*-\s*)0*(\d+)\b|(?:^|[\s._\-\[\(])e0*(\d+)\b|(?:^|[\s._\-\[\(])\d+x0*(\d+)\b|\bcap(?:itulo)?\s*0*(\d+)\b", fl, re.I)
     if em:
         ep = int(next(g for g in em.groups() if g is not None))
         return item_season, (ep, ep)
@@ -511,119 +480,164 @@ def filter_series_items(found, season, episode):
     return out
 
 
-def streams_for(media_type, req_id):
+def dest_entry(it):
+    """Return (real_link, entry) for the torznab item, following gate_to."""
     with _lock:
-        hit = _stream_cache.get(req_id)
-        if hit and time.time() - hit[0] < STREAM_TTL:
-            return hit[1]
+        e = _links.get(it["link"]) or {}
+        real = (e.get("gate_to") or it["link"]) if is_resolver(it["link"]) else it["link"]
+        return real, _links.get(real) or {}
 
-    parts = req_id.split(":")
-    if req_id.startswith("tmdb:"):
-        ext_id = f"{parts[0]}:{parts[1]}"
-        season = int(parts[2]) if len(parts) > 2 else None
-        episode = int(parts[3]) if len(parts) > 3 else None
-    else:
-        ext_id = parts[0]
-        season = int(parts[1]) if len(parts) > 1 else None
-        episode = int(parts[2]) if len(parts) > 2 else None
 
-    meta = cinemeta_meta(media_type, ext_id)
-    name = meta.get("name") or ""
-    year = (meta.get("year") or "")[:4] or (meta.get("releaseInfo") or "")[:4]
-    log(f"stream req {req_id} -> '{name}' {year} S{season}E{episode}")
-    if not name:
-        return []
+def item_ready_state(it):
+    """Classify item ready state: (tier, is_cached).
+    tier 0: playable immediately (extracted on disk or direct playable video on TorBox) -> cached=True
+    tier 1: in progress or archive on TorBox pending extraction -> cached=False
+    tier 2: uncached / not started -> cached=False
+    """
+    real, entry = dest_entry(it)
+    web_id = entry.get("web_id")
+    files = entry.get("files") or ([entry["file"]] if entry.get("file") else [])
+    if web_id and files:
+        p = os.path.join(extract_dir(web_id), files[0])
+        if os.path.exists(p):
+            return (0, True)
 
-    # Search original title first (site titles are often English), then localized
-    orig = (meta.get("original_name") or "").strip()
-    titles = [t for t in dict.fromkeys([orig, name]) if t]
+    if web_id and entry.get("direct"):
+        return (0, True)
 
-    queries = []
-    for indexer in INDEXERS:
-        for t in titles:
-            if media_type == "series" and season is not None:
-                queries.append((indexer, {"t": "tvsearch", "q": t, "season": season, "ep": episode, "limit": 500}))
-            else:
-                queries.append((indexer, {"t": "search", "q": f"{t} {year}".strip(), "limit": 500}))
-                queries.append((indexer, {"t": "search", "q": t, "limit": 500}))
+    with _lock:
+        in_flight = it.get("link") in _jobs or real in _jobs
 
-    seen, found, skipped = set(), [], 0
-    futures = [_pool.submit(torznab_items, ix, p) for ix, p in queries]
-    for f in futures:
-        try:
-            res = f.result(timeout=TORZNAB_TIMEOUT + 5)
-        except Exception:
-            res = []
-        for it in res:
-            if it["link"] in seen or (not supported_host(it["link"]) and not is_resolver(it["link"])):
-                continue
-            seen.add(it["link"])
-            if not item_matches_request(it, media_type, titles, year):
-                skipped += 1
-                continue
-            found.append(it)
-    if skipped:
-        log(f"filtered {skipped} mismatched items for '{name}'")
+    if in_flight:
+        return (1, False)
 
-    if media_type == "series" and season is not None:
-        found = filter_series_items(found, season, episode)
+    if not web_id:
+        return (2, False)
 
-    def dest_entry(it):
-        """Return (real_link, entry) for the torznab item, following gate_to."""
-        with _lock:
-            e = _links.get(it["link"]) or {}
-            real = (e.get("gate_to") or it["link"]) if is_resolver(it["link"]) else it["link"]
-            return real, _links.get(real) or {}
+    try:
+        item = torbox_mylist(web_id)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            with _lock:
+                _links.pop(real, None)
+                save_links()
+            return (2, False)
+        return (1, False)
+    except Exception:
+        return (1, False)
 
-    def live_web_id(it):
-        """web_id that still exists on TorBox (None purges stale entries)."""
-        real, entry = dest_entry(it)
-        web_id = entry.get("web_id")
-        if not web_id:
-            return None
-        try:
-            if torbox_mylist(web_id):
-                return web_id
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                return web_id  # API hiccup: keep it, assume alive
-        except Exception:
-            return web_id  # API hiccup: keep it, assume alive
+    if not item:
         with _lock:
             _links.pop(real, None)
             save_links()
-        return None
+        return (2, False)
 
-    futures = [_pool.submit(live_web_id, it) for it in found]
-    ready = dict(zip(map(id, found), (f.result() is not None for f in futures)))
-    # items already on TorBox first: mirrors needing a fresh download last
-    found = sorted(found, key=lambda it: not ready[id(it)])
+    if webdl_ready(item):
+        video, archive = classify_files(item)
+        if video and not archive:
+            with _lock:
+                entry = _links.setdefault(real, {})
+                entry["web_id"] = web_id
+                entry["direct"] = True
+                save_links()
+            return (0, True)
+        if archive:
+            return (1, False)
+    return (1, False)
+
+
+def streams_for(media_type, req_id):
+    with _lock:
+        hit = _stream_cache.get(req_id)
+        cached_found = hit[1] if (hit and time.time() - hit[0] < STREAM_TTL) else None
+
+    if cached_found:
+        ext_id, season, episode, name, found = cached_found
+    else:
+        parts = req_id.split(":")
+        if req_id.startswith("tmdb:"):
+            ext_id = f"{parts[0]}:{parts[1]}"
+            season = int(parts[2]) if len(parts) > 2 else None
+            episode = int(parts[3]) if len(parts) > 3 else None
+        else:
+            ext_id = parts[0]
+            season = int(parts[1]) if len(parts) > 1 else None
+            episode = int(parts[2]) if len(parts) > 2 else None
+
+        meta = cinemeta_meta(media_type, ext_id)
+        name = meta.get("name") or ""
+        year = (meta.get("year") or "")[:4] or (meta.get("releaseInfo") or "")[:4]
+        log(f"stream req {req_id} -> '{name}' {year} S{season}E{episode}")
+        if not name:
+            return []
+
+        # Search original title first (site titles are often English), then localized
+        orig = (meta.get("original_name") or "").strip()
+        titles = [t for t in dict.fromkeys([orig, name]) if t]
+
+        queries = []
+        for indexer in INDEXERS:
+            for t in titles:
+                if media_type == "series" and season is not None:
+                    queries.append((indexer, {"t": "tvsearch", "q": t, "season": season, "ep": episode, "limit": 500}))
+                else:
+                    queries.append((indexer, {"t": "search", "q": f"{t} {year}".strip(), "limit": 500}))
+                    queries.append((indexer, {"t": "search", "q": t, "limit": 500}))
+
+        seen, found, skipped = set(), [], 0
+        futures = [_pool.submit(torznab_items, ix, p) for ix, p in queries]
+        for f in futures:
+            try:
+                res = f.result(timeout=TORZNAB_TIMEOUT + 1)
+            except Exception:
+                res = []
+            for it in res:
+                if it["link"] in seen or (not supported_host(it["link"]) and not is_resolver(it["link"])):
+                    continue
+                seen.add(it["link"])
+                if not item_matches_request(it, media_type, titles, year):
+                    skipped += 1
+                    continue
+                found.append(it)
+        if skipped:
+            log(f"filtered {skipped} mismatched items for '{name}'")
+
+        if media_type == "series" and season is not None:
+            found = filter_series_items(found, season, episode)
+
+        if found:
+            with _lock:
+                _stream_cache[req_id] = (time.time(), (ext_id, season, episode, name, found))
+                if len(_stream_cache) > 500:
+                    _stream_cache.clear()
+
+    futures = [_pool.submit(item_ready_state, it) for it in found]
+    states = dict(zip(map(id, found), (f.result() for f in futures)))
+    # tier 0 first (cached/ready), then tier 1 (in TorBox/extracting), then tier 2 (unprocessed)
+    found = sorted(found, key=lambda it: states[id(it)][0])
     log(f"found {len(found)} hoster items for '{name}'")
 
     streams = []
     for it in found:
-        host = host_of(it["link"])
-        size = fmt_size(it["size"])
-        tag = "📦" if it["kind"] == "archive" else "🌐"
+        host = host_of(it.get("link", ""))
+        size = fmt_size(it.get("size", 0))
+        tag = "📦" if it.get("kind") == "archive" else "🌐"
         target_ep = it.get("_target_ep", episode)
         ep_ctx = f"{ext_id}:{season}:{target_ep}" if (season is not None and target_ep is not None) else req_id
+        _, is_cached = states.get(id(it), (2, False))
+        badge = "[TB+] ⚡" if is_cached else "[TB] ⏳"
         streams.append(
             {
-                "name": f"⚡WebDL {it.get('indexer','')}".strip(),
+                "name": f"{badge}WebDL {it.get('indexer','')}".strip(),
                 "title": f"{it['title']}\n{tag}{host}" + (f" • 💾{size}" if size else ""),
                 "url": f"{PUBLIC_BASE}/r/{b64e(it['link'] + '|' + ep_ctx)}",
-                "behaviorHints": {"service": "torbox", "cached": ready.get(id(it), False)},
+                "behaviorHints": {"service": "torbox", "cached": is_cached},
             }
         )
         if PREFETCH and len(streams) <= 2:
             # warm the primary and backup mirrors for fast fallback on playback
-            _pool.submit(prefetch, it["link"])
+            prefetch(it["link"])
 
-    if streams:
-        with _lock:
-            _stream_cache[req_id] = (time.time(), streams)
-            if len(_stream_cache) > 500:
-                _stream_cache.clear()
     return streams
 
 
@@ -687,29 +701,44 @@ def download_and_extract(web_id, file_id, file_name=None):
     archive_path = os.path.join(
         out_dir, f"src-{os.getpid()}-{int(time.time()*1000)}" + (ext_of(file_name or "") or ".rar"))
     log(f"downloading archive web_id={web_id}")
-    req = urllib.request.Request(real, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=600) as r, open(archive_path, "wb") as w:
-        shutil.copyfileobj(r, w, 1024 * 1024)
-    log(f"extracting {archive_path}")
     try:
-        subprocess.run(["bsdtar", "-xf", archive_path, "-C", out_dir], check=True, timeout=600)
-    except subprocess.CalledProcessError:
-        # likely encrypted (bsdtar can't do crypto): try unrar or 7z with known passwords
-        sevenzip = shutil.which("7zz") or shutil.which("7z")
-        is_7z = archive_path.lower().endswith(".7z")
-        for pw in ARCHIVE_PASSWORDS:
-            if is_7z and sevenzip:
-                cmd = [sevenzip, "x", "-y", f"-p{pw}", f"-o{out_dir}", archive_path]
-            elif is_7z:
-                cmd = ["bsdtar", "-xf", archive_path, "-C", out_dir, f"--passphrase={pw}"]
-            else:
-                cmd = ["unrar", "x", "-o+", f"-p{pw}", archive_path, out_dir + "/"]
-            r = subprocess.run(cmd, timeout=600, capture_output=True)
-            if r.returncode == 0:
-                break
+        aria2 = shutil.which("aria2c")
+        if aria2:
+            subprocess.run(
+                [aria2, "-x", "8", "-s", "8", "-k", "1M", "--file-allocation=none",
+                 "--allow-overwrite=true", "--auto-file-renaming=false", "--quiet=true",
+                 "-U", UA, "-d", out_dir, "-o", os.path.basename(archive_path), real],
+                check=True, timeout=900,
+            )
         else:
-            raise RuntimeError("extraction failed (encrypted archive, no working password)")
-    os.remove(archive_path)
+            req = urllib.request.Request(real, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=600) as r, open(archive_path, "wb") as w:
+                shutil.copyfileobj(r, w, 1024 * 1024)
+        log(f"extracting {archive_path}")
+        try:
+            subprocess.run(["bsdtar", "-xf", archive_path, "-C", out_dir], check=True, timeout=600)
+        except subprocess.CalledProcessError:
+            # likely encrypted (bsdtar can't do crypto): try unrar or 7z with known passwords
+            sevenzip = shutil.which("7zz") or shutil.which("7z")
+            is_7z = archive_path.lower().endswith(".7z")
+            for pw in ARCHIVE_PASSWORDS:
+                if is_7z and sevenzip:
+                    cmd = [sevenzip, "x", "-y", f"-p{pw}", f"-o{out_dir}", archive_path]
+                elif is_7z:
+                    cmd = ["bsdtar", "-xf", archive_path, "-C", out_dir, f"--passphrase={pw}"]
+                else:
+                    cmd = ["unrar", "x", "-o+", f"-p{pw}", archive_path, out_dir + "/"]
+                r = subprocess.run(cmd, timeout=600, capture_output=True)
+                if r.returncode == 0:
+                    break
+            else:
+                raise RuntimeError("extraction failed (encrypted archive, no working password)")
+    finally:
+        if os.path.exists(archive_path):
+            try:
+                os.remove(archive_path)
+            except Exception:
+                pass
     videos = []
     for root, _, files in os.walk(out_dir):
         for fn in files:
@@ -787,7 +816,7 @@ def do_resolve(link, ctx=None):
 
     item, web_id = ensure_webdl(link)
     t0 = time.time()
-    deadline = t0 + RESOLVE_TIMEOUT
+    deadline = t0 + BG_RESOLVE_TIMEOUT
     last_state = None
     while True:
         if item is None:
@@ -795,6 +824,9 @@ def do_resolve(link, ctx=None):
         if item and webdl_ready(item):
             video, archive = classify_files(item)
             if video:
+                with _lock:
+                    _links[link] = {"web_id": web_id, "direct": True}
+                    save_links()
                 return "redirect", requestdl_url(web_id, file_id=video.get("id"))
             if archive:
                 with _lock:
@@ -822,19 +854,24 @@ def do_resolve(link, ctx=None):
                 last_state = st
             if any(x in st.lower() for x in ("failed", "error", "deleted", "expired")):
                 return None, f"torbox-state:{st}"
-            # fail fast: still being processed on TorBox (downloading/decrypting/
-            # queued/...) -> serve placeholder instead of holding the request
-            if time.time() - t0 > RESOLVE_FAILFAST:
-                return None, f"downloading:{st or 'unknown'}"
         if time.time() > deadline:
             return None, f"downloading:{last_state or 'unknown'}"
         time.sleep(5)
         item = None
 
 
-def resolve_async(link, ctx=None):
-    """Dedup: concurrent resolves of the same link share one job.
-    'files' results are post-selected per caller via ctx (episode pick)."""
+def _pick_extracted(web_id, videos, ctx):
+    picked = pick_episode(videos, ctx)
+    if not picked:
+        if len(videos) > 1 and re.search(r":\d+:\d+$", ctx or ""):
+            return None, "episode-not-in-pack"  # better than serving the wrong episode
+        picked = max(videos, key=lambda v: os.path.getsize(os.path.join(extract_dir(web_id), v)))
+    p = os.path.join(extract_dir(web_id), picked)
+    return "file", (web_id, picked, p, os.path.getsize(p))
+
+
+def start_resolve(link):
+    """Ensure a background resolve+extract job is running for link; return its Event."""
     with _lock:
         ev = _jobs.get(link)
         if ev is None:
@@ -855,18 +892,31 @@ def resolve_async(link, ctx=None):
                 ev.set()
                 with _lock:
                     _jobs.pop(link, None)
-        _pool.submit(run)
-    ev.wait(timeout=RESOLVE_TIMEOUT + 660)
+        _bg_pool.submit(run)
+    return ev
+
+
+def resolve_async(link, ctx=None):
+    """Fast-path check + bounded wait (RESOLVE_FAILFAST) on background job.
+    Slow downloads/extractions continue in the background while /r/ serves downloading.mp4."""
+    with _lock:
+        e = _links.get(link) or {}
+        real = e.get("gate_to") if is_resolver(link) else link
+        entry = (_links.get(real) or {}) if real else {}
+        web_id = entry.get("web_id")
+        files = entry.get("files") or ([entry["file"]] if entry.get("file") else [])
+    if web_id and files:
+        p = os.path.join(extract_dir(web_id), files[0])
+        if os.path.exists(p):
+            return _pick_extracted(web_id, files, ctx)
+
+    ev = start_resolve(link)
+    if not ev.wait(timeout=RESOLVE_FAILFAST):
+        return None, "downloading:in-progress"
     res = ev.result or (None, "timeout")
     if res[0] == "files":
         web_id, videos = res[1]
-        picked = pick_episode(videos, ctx)
-        if not picked:
-            if len(videos) > 1 and re.search(r":\d+:\d+$", ctx or ""):
-                return None, "episode-not-in-pack"  # better than serving the wrong episode
-            picked = max(videos, key=lambda v: os.path.getsize(os.path.join(extract_dir(web_id), v)))
-        p = os.path.join(extract_dir(web_id), picked)
-        return "file", (web_id, picked, p, os.path.getsize(p))
+        return _pick_extracted(web_id, videos, ctx)
     return res
 
 

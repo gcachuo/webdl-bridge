@@ -1,5 +1,5 @@
 FROM python:3.12-alpine
-RUN apk add --no-cache libarchive-tools gcompat libstdc++ 7zip \
+RUN apk add --no-cache aria2 libarchive-tools gcompat libstdc++ 7zip \
  && wget -qO /tmp/unrar.tgz https://www.rarlab.com/rar/rarlinux-x64-712.tar.gz \
  && tar xzf /tmp/unrar.tgz -C /usr/local/bin --strip-components=1 rar/unrar \
  && rm /tmp/unrar.tgz
